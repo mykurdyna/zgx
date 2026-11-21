@@ -2933,7 +2933,9 @@ impl Host {
             .then(|| crate::native_host::webkitgtk::ime_page(&self.context.ui))
             .flatten();
         #[cfg(not(all(target_os = "linux", feature = "webkitgtk")))]
-        let page: Option<NodeId> = None;
+        let page: Option<NodeId> = (editor.is_none() && self.native_focused)
+            .then(|| crate::ime_page::focused(&self.context.ui))
+            .flatten();
         let target = editor.as_ref().map(|editor| editor.node).or(page);
         // What kind of text it takes, for the input method (Wayland's content
         // purpose; Windows' input scope through the framework, `tsf.rs`).
@@ -3840,7 +3842,10 @@ impl Host {
         // The clause an input method converts, else the caret, where they
         // show (zoomed too): where its candidates go, as under a native
         // field's marked text.
-        let caret = editor.as_ref().map(|editor| editor.input_method_area());
+        let caret = editor
+            .as_ref()
+            .map(|editor| editor.input_method_area())
+            .or_else(|| crate::ime_page::area(ui));
         #[cfg(all(target_os = "linux", feature = "webkitgtk"))]
         let caret = caret.or_else(|| crate::native_host::webkitgtk::ime_area(ui));
         // Wayland's text input: a new area committed while an input method's

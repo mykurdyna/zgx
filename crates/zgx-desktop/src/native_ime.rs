@@ -218,12 +218,15 @@ pub(crate) fn dispatch(
     session_target: Option<NodeId>,
     event: Ime,
 ) -> Result<Option<bool>, LayoutFeedbackError> {
+    let page = crate::ime_page::focused(ui);
     if !native_focused
         || session_target.is_none()
-        || session_target != editable_editor(ui, true).map(|editor| editor.node)
+        || (session_target != editable_editor(ui, true).map(|editor| editor.node)
+            && session_target != page)
     {
         return Ok(None);
     }
+    let page_composing = matches!(&event, Ime::Preedit(text, _) if !text.is_empty());
     let event = match event {
         Ime::Enabled => return Ok(None),
         Ime::Disabled => InputEvent::ImePreedit {
@@ -237,6 +240,9 @@ pub(crate) fn dispatch(
         Ime::Commit(text) => InputEvent::ImeCommit(text),
     };
     let result = ui.try_dispatch(event)?;
+    if page.is_some() && session_target == page {
+        return Ok(Some(!result.focus_changed && page_composing));
+    }
     // Custom handlers may reject or replace preedit. Keyboard suppression must
     // follow the editor's actual state, not the text of the incoming event.
     Ok(Some(

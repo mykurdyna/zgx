@@ -205,6 +205,7 @@ pub use terminal_process::{
 pub mod accessibility;
 
 pub mod application;
+pub mod ime_page;
 pub use application::{
     Application, TaskSpawner, WindowContext, WindowFactory, WindowHandle, WindowOptions,
 };
