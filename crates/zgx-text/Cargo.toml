@@ -24,6 +24,10 @@ cosmic-text = { package = "zgx-cosmic-text", version = "0.19.14", path = "../../
 unicode-segmentation = "1.12"
 rustc-hash = "2.1"
 
+# Glyphs drawn as Windows draws its own text (direct_write_glyphs.rs).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", default-features = false, features = ["Win32_Foundation", "Win32_Graphics_DirectWrite"] }
+
 # fontconfig's configuration, read as fontdb reads it, for what the system
 # font cache watches (font_cache.rs); fontdb's own, already in the tree.
 [target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))'.dependencies]

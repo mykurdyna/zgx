@@ -1424,7 +1424,8 @@ impl TextCache {
             return crate::text::ShapedText::with_runs(fonts, rich, width).size();
         };
         let hash = self.entry(fonts, Source::Rich(rich), false, Need::Layout);
-        let laid = self.laid_out(fonts, hash, width);
+        let unwrapped = if crate::text::single_line(rich) { None } else { width };
+        let laid = self.laid_out(fonts, hash, unwrapped);
         let size = |w: f32, h: f32, run: cosmic_text::LayoutRun<'_>| {
             (w.max(run.line_w), h.max(run.line_top + run.line_height))
         };

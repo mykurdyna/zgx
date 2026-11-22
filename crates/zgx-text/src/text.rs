@@ -2,8 +2,9 @@
 pub use cosmic_text::Affinity;
 use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping};
 
-/// `key`'s glyph image: swash's, or for a face whose shapes swash can't
-/// draw (macOS 26's PingFang, `hvgl` only) Core Text's. Asked only where
+/// `key`'s glyph image: on Windows DirectWrite's (`direct_write_glyphs`), as
+/// the system draws its text; elsewhere swash's, or for a face whose shapes
+/// swash can't draw (macOS 26's PingFang, `hvgl` only) Core Text's. Asked only where
 /// swash gave none: a glyph cache miss with nothing to show. None past
 /// `MAX_GLYPH_SIZE` pixels: its mask grows with the size squared, so a
 /// script's `size = 1e6` (or a canvas zoomed far in) would ask for more
@@ -17,6 +18,10 @@ pub fn glyph_image(
     let size = f32::from_bits(key.font_size_bits);
     if size.is_nan() || size > MAX_GLYPH_SIZE {
         return None;
+    }
+    #[cfg(windows)]
+    if let Some(image) = crate::direct_write_glyphs::glyph_image(fonts, key) {
+        return Some(image);
     }
     let image = swash.get_image_uncached(fonts, key);
     #[cfg(target_os = "macos")]
@@ -1801,7 +1806,8 @@ pub fn rich_buffer(
     let Some(limit) = clamp(rich) else {
         return rich_buffer_raw(fonts, rich, width, height, false);
     };
-    let original = rich_buffer_raw(fonts, rich, width, None, false);
+    let laid = if single_line(rich) { None } else { width };
+    let original = rich_buffer_raw(fonts, rich, laid, None, false);
     let rows = Rows::of(original.layout_runs(), &original.lines, limit);
     truncated(fonts, rich, width, limit, &rows).unwrap_or(original)
 }
@@ -1814,6 +1820,14 @@ pub(crate) fn clamp(rich: &zgx::rich_text::RichText) -> Option<usize> {
         .line_clamp
         .map(|n| n.get() as usize)
         .or((options.overflow == TextOverflow::Ellipsis).then_some(1))
+}
+/// Whether `rich` ends in an ellipsis with no line clamp: CSS's
+/// `text-overflow: ellipsis` on a line that doesn't wrap, cut at the last
+/// character that fits. A clamp (`line_clamp`, as `truncate` sets) wraps at
+/// the width and ends its last line kept, as CSS's `line-clamp` does.
+pub(crate) fn single_line(rich: &zgx::rich_text::RichText) -> bool {
+    let options = rich.options();
+    options.line_clamp.is_none() && options.overflow == zgx::text_layout::TextOverflow::Ellipsis
 }
 /// What truncating a text needs of its layout uncut (`truncated`): each
 /// row's line, byte range and width, where each line starts, and the
@@ -1869,6 +1883,7 @@ pub(crate) fn truncated(
 ) -> Option<Buffer> {
     use zgx::text_layout::TextOverflow;
     let options = rich.options();
+    let single = single_line(rich);
     let (starts, kept, rows) = (&rows.starts, &rows.kept, &rows.rows);
     let overflow =
         rows.len() > limit || width.is_some_and(|w| rows.iter().take(limit).any(|r| r.3 > w));
@@ -1934,6 +1949,13 @@ pub(crate) fn truncated(
             return buffer;
         }
         let truncated = rich.remade(content, runs).unwrap();
+        if single {
+            let mut buffer = rich_buffer_unshaped(fonts, &truncated, ellipsis, Vec::new());
+            buffer.set_wrap(cosmic_text::Wrap::None);
+            buffer.set_size(wrap_width(width), None);
+            buffer.shape_until_scroll(fonts, false);
+            return buffer;
+        }
         rich_buffer_raw(fonts, &truncated, width, None, ellipsis)
     };
     if options.overflow == TextOverflow::Clip {
@@ -2381,6 +2403,45 @@ mod rich_tests {
             "the two families differ: {regular} {geist}"
         );
         assert_eq!(medium, regular, "its own Book, not Geist's Medium");
+    }
+    #[test]
+    fn an_ellipsis_without_a_clamp_cuts_inside_a_word_where_a_clamp_cuts_after_one() {
+        use zgx::text_layout::{TextOptions, TextOverflow};
+        let mut fonts = FontSystem::new();
+        let text = "The Hay Wain - Wikipedia";
+        let rich = RichText::new(
+            text,
+            vec![TextRun {
+                range: 0..text.len(),
+                font_size: 13.,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let whole = rich_buffer(&mut fonts, &rich, None, None)
+            .layout_runs()
+            .map(|row| row.line_w)
+            .fold(0_f32, f32::max);
+        let width = whole * 0.85;
+        let shown = |options: TextOptions, fonts: &mut FontSystem| {
+            let buffer = rich_buffer(fonts, &rich.clone().with_options(options), Some(width), None);
+            assert_eq!(buffer.layout_runs().count(), 1);
+            assert!(buffer.layout_runs().all(|row| row.line_w <= width + 0.001));
+            buffer.lines.iter().map(|line| line.text().to_owned()).collect::<String>()
+        };
+        let single = shown(
+            TextOptions { overflow: TextOverflow::Ellipsis, line_clamp: None },
+            &mut fonts,
+        );
+        let clamped = shown(
+            TextOptions {
+                overflow: TextOverflow::Ellipsis,
+                line_clamp: std::num::NonZeroU32::new(1),
+            },
+            &mut fonts,
+        );
+        assert!(single.starts_with("The Hay Wain - W") && single.ends_with('…'), "{single}");
+        assert!(clamped.starts_with("The Hay Wain") && !clamped.contains("Wi"), "{clamped}");
     }
     #[test]
     fn display_line_clamp_shapes_ellipsis_and_excludes_hidden_link_geometry() {

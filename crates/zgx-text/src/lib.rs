@@ -14,6 +14,9 @@ mod core_text_fallback;
 pub use core_text_fallback::{core_text_advance, install_core_text_fallback};
 #[cfg(target_os = "macos")]
 mod core_text_glyphs;
+#[cfg(windows)]
+#[doc(hidden)]
+pub mod direct_write_glyphs;
 #[doc(hidden)]
 pub mod font_cache;
 pub mod prepared;

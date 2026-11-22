@@ -1655,13 +1655,32 @@ fn glyphs_of<'a>(
 /// (`FIRM_COVERAGE`). At 2x and over, where a pixel is too small to see,
 /// glyphs keep their subpixel places and outlines' plain coverage.
 const SHARP_TEXT_BELOW: f32 = 2.;
+/// How glyph masks blend where the system's text rasterizer draws them
+/// (DirectWrite, Windows): `viewport.w` for `draw.wgsl`'s `dwrite`, 1 + the
+/// row of the system's text gamma in its table (1.0 to 2.2 by tenths) + 16
+/// times its grayscale enhanced contrast in 64ths. 0 elsewhere: masks firm
+/// as `firm` has it.
+pub fn text_blend() -> f32 {
+    static BLEND: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
+        #[cfg(windows)]
+        if zgx_text::direct_write_glyphs::available()
+            && let Some((gamma, contrast)) = zgx_text::direct_write_glyphs::rendering_params()
+        {
+            let row = ((gamma * 10. + 0.5).floor().clamp(10., 22.) - 10.) as u32;
+            let contrast = (contrast.clamp(0., 255.) * 64.).round() as u32;
+            return (1 + row + 16 * contrast) as f32;
+        }
+        0.
+    });
+    *BLEND
+}
 /// A glyph quad's `options.y` below `SHARP_TEXT_BELOW`: a mask whose coverage
 /// `draw.wgsl` firms by its colour (`firm`).
 const FIRM_GLYPH: f32 = 1.25;
 /// A glyph's `options.y`: straight alpha, firmed below `SHARP_TEXT_BELOW` if a
 /// mask (a colour glyph's own colours stay as they are).
 fn glyph_texture(color: bool, scale: f32) -> f32 {
-    if !color && scale < SHARP_TEXT_BELOW {
+    if !color && (scale < SHARP_TEXT_BELOW || text_blend() > 0.) {
         FIRM_GLYPH
     } else {
         1.
@@ -1679,7 +1698,11 @@ fn styled_glyphs<'a>(
         glyphs.reserve(run.glyphs.len());
         // Below 2x, the line's start on a whole pixel, and each glyph on one
         // counted from there: a line that only moves keeps its spacing.
-        let sharp = scale < SHARP_TEXT_BELOW;
+        // Where the system draws glyphs (`text_blend`), each keeps its
+        // quarter-pixel place, as DirectWrite's natural mode does: its
+        // hinting holds each glyph's stems on whole pixels, and rounding
+        // every glyph's place apart spaced letters unevenly.
+        let sharp = scale < SHARP_TEXT_BELOW && text_blend() == 0.;
         let line_start = match run.glyphs.first() {
             Some(glyph) if sharp => (glyph.x + glyph.font_size * glyph.x_offset) * scale,
             _ => 0.,
@@ -8513,7 +8536,7 @@ impl GpuRenderer {
         self.viewport_bind = self.viewports.get(&key).map(|(_, bind)| bind.clone());
         #[cfg(any(target_os = "macos", d3d11))]
         {
-            self.viewport_values = [width, height, self.scale, 0.];
+            self.viewport_values = [width, height, self.scale, text_blend()];
         }
     }
     /// The `viewports` key of a target `width` × `height` points, its
@@ -8530,7 +8553,7 @@ impl GpuRenderer {
                 self.unified,
                 "viewport",
                 // Logical size, and device pixels per logical pixel.
-                bytemuck::cast_slice(&[width, height, self.scale, 0.]),
+                bytemuck::cast_slice(&[width, height, self.scale, text_blend()]),
                 wgpu::BufferUsages::UNIFORM,
             );
             let bind = self.viewport_group(&buffer, self.no_regions.as_entire_binding());
@@ -21441,10 +21464,44 @@ pub fn glyph_image(
 ) -> Option<cosmic_text::SwashImage> {
     text::glyph_image(swash, fonts, key)
 }
+/// `draw.wgsl`'s `dwrite`: coverage `a` in `color` as DirectWrite blends it,
+/// with the gamma and contrast `blend` (`text_blend`) packs.
+fn dwrite_coverage(a: f32, color: Color, blend: f32) -> f32 {
+    const RATIOS: [[f32; 4]; 13] = [
+        [0., 0., 0., 0.],
+        [0.0166, -0.0807, 0.2227, -0.0751],
+        [0.0350, -0.1760, 0.4325, -0.1370],
+        [0.0543, -0.2821, 0.6302, -0.1876],
+        [0.0739, -0.3963, 0.8167, -0.2287],
+        [0.0933, -0.5161, 0.9926, -0.2616],
+        [0.1121, -0.6395, 1.1588, -0.2877],
+        [0.1300, -0.7649, 1.3159, -0.3080],
+        [0.1469, -0.8911, 1.4644, -0.3234],
+        [0.1627, -1.0170, 1.6051, -0.3347],
+        [0.1773, -1.1420, 1.7385, -0.3426],
+        [0.1908, -1.2652, 1.8650, -0.3476],
+        [0.2031, -1.3864, 1.9851, -0.3501],
+    ];
+    let t = blend - 1.;
+    let q = (t / 16.).floor();
+    let row = (t - q * 16.).clamp(0., 12.) as usize;
+    let (norm13, norm24) = (65536. / (255. * 255.), 256. / 255.);
+    let r = RATIOS[row];
+    let g = [r[0] * norm13, r[1] * norm24, r[2] * norm13, r[3] * norm24];
+    let [red, green, blue] = [color.0, color.1, color.2].map(|c| c as f32 / 255.);
+    let k = (q / 64.) * (4. * (0.75 - (0.30 * red + 0.59 * green + 0.11 * blue))).clamp(0., 1.);
+    let f = 0.25 * red + 0.5 * green + 0.25 * blue;
+    let c = a * (k + 1.) / (a * k + 1.);
+    c + c * (1. - c) * ((g[0] * f + g[1]) * c + (g[2] * f + g[3]))
+}
 /// A mask glyph's coverage `a` as `draw.wgsl` draws it in `color` at
 /// `scale`: firmed below `SHARP_TEXT_BELOW` (`firm`, `firmness`).
 #[doc(hidden)]
 pub fn glyph_coverage(a: f32, color: Color, scale: f32) -> f32 {
+    let blend = text_blend();
+    if blend > 0. {
+        return dwrite_coverage(a, color, blend);
+    }
     if scale >= SHARP_TEXT_BELOW {
         return a;
     }
