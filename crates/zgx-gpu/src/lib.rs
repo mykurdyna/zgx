@@ -760,6 +760,10 @@ enum Shading {
     /// `shade` behind what's drawn (destination-over): a gradient text's
     /// box, marks, selection and shadows under its filled glyphs.
     Behind,
+    /// ClearType glyphs (`SUBPIXEL_GLYPH`) and flat quads, plain, into the
+    /// window's own opaque target: `fs_subpixel`, red, green and blue
+    /// blended apart (dual-source); `basic` where the device can't.
+    Subpixel,
 }
 fn shading(quad: &Quad, scale: f32) -> Shading {
     // A panel with square corners and no border only antialiases its edges:
@@ -800,6 +804,8 @@ fn shading(quad: &Quad, scale: f32) -> Shading {
 /// need the full shader there.
 struct QuadPipelines {
     device: wgpu::Device,
+    /// The ClearType glyphs' pipeline, made when first drawn (`subpixel`).
+    subpixel: std::cell::OnceCell<Option<wgpu::RenderPipeline>>,
     /// Their module (draw.wgsl), made with the first pipeline: a window
     /// whose frames Metal encodes directly (metal_frame.rs) needs none.
     shader: std::cell::OnceCell<wgpu::ShaderModule>,
@@ -847,6 +853,10 @@ impl QuadPipelines {
             Shading::Polyline => return &self.polylines().pipeline,
             Shading::SourceIn => (&self.source_in, false, Some(SOURCE_IN)),
             Shading::Behind => (&self.behind, false, Some(BEHIND)),
+            Shading::Subpixel => match self.subpixel() {
+                Some(pipeline) => return pipeline,
+                None => (&self.basic, true, Some(OVER)),
+            },
         };
         if let Some(pipeline) = cell.get() {
             return pipeline;
@@ -877,6 +887,31 @@ impl QuadPipelines {
     }
     fn shader(&self) -> &wgpu::ShaderModule {
         self.shader.get_or_init(|| quad_shader(&self.device))
+    }
+    /// The ClearType glyphs' pipeline (`Shading::Subpixel`): draw.wgsl and
+    /// subpixel.wgsl in a module with dual-source blending, which only a
+    /// device with the feature takes. None without it.
+    fn subpixel(&self) -> Option<&wgpu::RenderPipeline> {
+        self.subpixel
+            .get_or_init(|| {
+                let device = &self.device;
+                if !device.features().contains(wgpu::Features::DUAL_SOURCE_BLENDING) {
+                    return None;
+                }
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("cleartype glyphs"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        format!(
+                            "enable dual_source_blending;\n{}\n{}",
+                            include_str!("draw.wgsl"),
+                            include_str!("subpixel.wgsl")
+                        )
+                        .into(),
+                    ),
+                });
+                Some(subpixel_pipeline(device, &module, &self.layout))
+            })
+            .as_ref()
     }
     fn polylines(&self) -> &Polylines {
         self.polylines.get_or_init(|| {
@@ -1658,28 +1693,51 @@ const SHARP_TEXT_BELOW: f32 = 2.;
 /// How glyph masks blend where the system's text rasterizer draws them
 /// (DirectWrite, Windows): `viewport.w` for `draw.wgsl`'s `dwrite`, 1 + the
 /// row of the system's text gamma in its table (1.0 to 2.2 by tenths) + 16
-/// times its grayscale enhanced contrast in 64ths. 0 elsewhere: masks firm
-/// as `firm` has it.
+/// times its grayscale enhanced contrast in 64ths + 4096 times ClearType's
+/// (each up to 255/64). 0 elsewhere: masks firm as `firm` has it.
 pub fn text_blend() -> f32 {
     static BLEND: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
         #[cfg(windows)]
         if zgx_text::direct_write_glyphs::available()
-            && let Some((gamma, contrast)) = zgx_text::direct_write_glyphs::rendering_params()
+            && let Some(params) = zgx_text::direct_write_glyphs::params()
         {
-            let row = ((gamma * 10. + 0.5).floor().clamp(10., 22.) - 10.) as u32;
-            let contrast = (contrast.clamp(0., 255.) * 64.).round() as u32;
-            return (1 + row + 16 * contrast) as f32;
+            let row = ((params.gamma * 10. + 0.5).floor().clamp(10., 22.) - 10.) as u32;
+            let sixty_fourths =
+                |contrast: f32| (contrast.clamp(0., 255. / 64.) * 64.).round() as u32;
+            let grayscale = sixty_fourths(params.grayscale_contrast);
+            let cleartype = sixty_fourths(params.cleartype_contrast);
+            return (1 + row + 16 * grayscale + 4096 * cleartype) as f32;
         }
         0.
     });
     *BLEND
 }
+/// Whether glyphs here are ClearType's (`SUBPIXEL_GLYPH`): the system
+/// draws them with ClearType on (`direct_write_glyphs::Params::cleartype`).
+fn cleartype() -> bool {
+    #[cfg(windows)]
+    {
+        zgx_text::direct_write_glyphs::params().is_some_and(|params| params.cleartype)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+/// A ClearType glyph quad's `options.y` (`AtlasEntry::subpixel`): within
+/// `draw.wgsl`'s mask band, so a pipeline not blending subpixels apart
+/// draws it as grayscale by its coverage's mean; `fs_subpixel` blends its
+/// red, green and blue apart (`Shading::Subpixel`).
+const SUBPIXEL_GLYPH: f32 = 1.3;
 /// A glyph quad's `options.y` below `SHARP_TEXT_BELOW`: a mask whose coverage
 /// `draw.wgsl` firms by its colour (`firm`).
 const FIRM_GLYPH: f32 = 1.25;
 /// A glyph's `options.y`: straight alpha, firmed below `SHARP_TEXT_BELOW` if a
 /// mask (a colour glyph's own colours stay as they are).
-fn glyph_texture(color: bool, scale: f32) -> f32 {
+fn glyph_texture(color: bool, subpixel: bool, scale: f32) -> f32 {
+    if subpixel {
+        return SUBPIXEL_GLYPH;
+    }
     if !color && (scale < SHARP_TEXT_BELOW || text_blend() > 0.) {
         FIRM_GLYPH
     } else {
@@ -2122,6 +2180,9 @@ struct AtlasEntry {
     /// A colour glyph's (an emoji's): its texels its own colours, which the
     /// text's colour doesn't tint (`COLOR_GLYPH`).
     color: bool,
+    /// A ClearType glyph's: its texels red, green and blue coverage and
+    /// their mean (`SUBPIXEL_GLYPH`).
+    subpixel: bool,
 }
 /// `TextQuad::paint[2]` of a colour glyph's quad (`AtlasEntry::color`):
 /// placed white, with its text's alpha, so `basic`'s colour times texel
@@ -4056,6 +4117,9 @@ impl<'p> Picks<'p> {
             | Shading::FilterBlend(_)
             | Shading::ImageEffect => self.full,
             Shading::Basic => self.basic,
+            Shading::Subpixel => self
+                .quads
+                .map_or(self.basic, |quads| quads.get(Shading::Subpixel)),
             Shading::Opaque => self.opaque,
             Shading::Polyline => self.polyline.expect("made for a frame with polylines"),
             // Drawn in a gradient text's layer alone (`gradient_text_quads`).
@@ -4125,7 +4189,8 @@ fn merged_shading(a: Shading, b: Shading) -> Option<Shading> {
         | Shading::ImageEffect
         | Shading::Polyline
         | Shading::SourceIn
-        | Shading::Behind => None,
+        | Shading::Behind
+        | Shading::Subpixel => None,
     };
     Some(if cost(a)? >= cost(b)? { a } else { b })
 }
@@ -4901,6 +4966,7 @@ impl GpuContext {
         } = prepared;
         let quads = QuadPipelines {
             device: device.clone(),
+            subpixel: Default::default(),
             shader: Default::default(),
             layout: quad_layout.clone(),
             full: Default::default(),
@@ -11590,7 +11656,7 @@ impl GpuRenderer {
                                             }),
                                             paint: [
                                                 0.,
-                                                glyph_texture(a.color, self.scale),
+                                                glyph_texture(a.color, a.subpixel, self.scale),
                                                 if a.color { COLOR_GLYPH } else { 0. },
                                                 0.,
                                             ],
@@ -11785,11 +11851,19 @@ impl GpuRenderer {
                     let split = self.split_shading;
                     // A glyph's quad (`glyph_quad`) is plain unless faded or in a
                     // clip region, and textured: one shading for all of them.
-                    let glyphs =
-                        glyphs_alone.then_some(match item.effects.edge_fade != 0. || in_region {
+                    // ClearType's where no clip region shades it: none, or one
+                    // the text lies wholly inside (`mark_region` left its
+                    // quads unmasked).
+                    let run = &quads[draw.start as usize..draw.end as usize];
+                    let unclipped = item.effects.edge_fade == 0.
+                        && (!in_region || run.iter().all(|quad| quad.mask[0] <= 0.));
+                    let glyphs = glyphs_alone.then_some(
+                        match item.effects.edge_fade != 0. || in_region {
+                            _ if unclipped && self.subpixel_glyphs(run) => Shading::Subpixel,
                             true => Shading::Full,
                             false => Shading::Basic,
-                        });
+                        },
+                    );
                     push_draw(
                         &mut draws, &quads, draw, split, polylines, self.scale, glyphs,
                     );
@@ -12319,6 +12393,7 @@ impl GpuRenderer {
                         | Shading::Blend
                         | Shading::FilterBlend(_)
                         | Shading::ImageEffect
+                        | Shading::Subpixel
                 )
             })
             && (!self.present_unpremultiplies || self.background.3 == 255)
@@ -12883,6 +12958,7 @@ impl GpuRenderer {
                     _,
                     Shading::Full
                     | Shading::Basic
+                    | Shading::Subpixel
                     | Shading::Opaque
                     | Shading::Polyline
                     | Shading::SourceIn
@@ -15827,6 +15903,26 @@ impl GpuRenderer {
         held
     }
     /// `evict_glyphs`' giving back: whether any cell was.
+    /// Whether `quads`, a text's glyphs alone, draw as ClearType's
+    /// (`Shading::Subpixel`): ClearType glyphs (and flat quads, its
+    /// underlines), drawn into the window's own target, which is opaque,
+    /// by a device that blends two sources, outside Direct3D 11's frames.
+    fn subpixel_glyphs(&self, quads: &[Quad]) -> bool {
+        #[cfg(d3d11)]
+        if *crate::d3d11_frame::ENABLED {
+            return false;
+        }
+        !self.in_layer
+            && cleartype()
+            && self
+                .device
+                .features()
+                .contains(wgpu::Features::DUAL_SOURCE_BLENDING)
+            && quads.iter().any(|quad| quad.options[1] == SUBPIXEL_GLYPH)
+            && quads
+                .iter()
+                .all(|quad| quad.options[1] == SUBPIXEL_GLYPH || quad.options[1] < 0.5)
+    }
     fn free_glyphs(&mut self) -> bool {
         let held = self.held_glyphs();
         let mut freed = false;
@@ -16147,21 +16243,9 @@ impl GpuRenderer {
                 }
                 SwashContent::SubpixelMask => {
                     let bytes = p.width as usize * 4;
-                    for (row, pixels) in image.data.chunks_exact(bytes).enumerate() {
+                    for (row, texels) in image.data.chunks_exact(bytes).enumerate() {
                         let start = row_start(row as u32);
-                        for (texel, pixel) in rgba[start..]
-                            .as_chunks_mut::<4>()
-                            .0
-                            .iter_mut()
-                            .zip(pixels.as_chunks::<4>().0)
-                        {
-                            texel.copy_from_slice(&[
-                                255,
-                                255,
-                                255,
-                                pixel[0].max(pixel[1]).max(pixel[2]),
-                            ]);
-                        }
+                        rgba[start..start + bytes].copy_from_slice(texels);
                     }
                 }
             }
@@ -16182,6 +16266,7 @@ impl GpuRenderer {
             left: p.left,
             top: p.top,
             color: matches!(image.content, SwashContent::Color),
+            subpixel: matches!(image.content, SwashContent::SubpixelMask),
         };
         self.entries.insert(AtlasKey::from(key), Some(entry));
         stats.glyph_uploads += 1;
@@ -19167,7 +19252,7 @@ fn glyph_quad(
         color,
         paint: [
             0.,
-            glyph_texture(a.color, scale),
+            glyph_texture(a.color, a.subpixel, scale),
             if a.color { COLOR_GLYPH } else { 0. },
             0.,
         ],
@@ -20628,6 +20713,57 @@ fn quad_pipeline(
         cache: None,
     })
 }
+/// The ClearType glyphs' pipeline (`Shading::Subpixel`): `basic`'s
+/// quads, `fs_subpixel` blending each subpixel by its own coverage, the
+/// second source: `color * coverage + target * (1 - coverage)`.
+fn subpixel_pipeline(
+    device: &wgpu::Device,
+    module: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+) -> wgpu::RenderPipeline {
+    let all = wgpu::vertex_attr_array![0=>Float32x4,1=>Float32x4,2=>Float32x4,3=>Float32x4,4=>Float32x4,5=>Float32x4,6=>Float32x4,7=>Float32x4];
+    let attributes = [all[0], all[1], all[2], all[4]];
+    let blend = |src_factor, dst_factor| wgpu::BlendComponent {
+        src_factor,
+        dst_factor,
+        operation: wgpu::BlendOperation::Add,
+    };
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("cleartype glyphs"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module,
+            entry_point: Some("vs_basic"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: 128,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &attributes,
+            }],
+        },
+        primitive: QUAD_STRIP,
+        depth_stencil: None,
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module,
+            entry_point: Some("fs_subpixel"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: FORMAT,
+                blend: Some(wgpu::BlendState {
+                    color: blend(wgpu::BlendFactor::Src1, wgpu::BlendFactor::OneMinusSrc1),
+                    alpha: blend(
+                        wgpu::BlendFactor::Src1Alpha,
+                        wgpu::BlendFactor::OneMinusSrc1Alpha,
+                    ),
+                }),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
 /// A shader fill's pipeline, or the image effects': quads blended over the
 /// target, `module`'s `entry` shading them (`zgx_fill`, see `fill_source`;
 /// `zgx_image_effect`, see `image_effect_source`).
@@ -21465,7 +21601,7 @@ pub fn glyph_image(
     text::glyph_image(swash, fonts, key)
 }
 /// `draw.wgsl`'s `dwrite`: coverage `a` in `color` as DirectWrite blends it,
-/// with the gamma and contrast `blend` (`text_blend`) packs.
+/// with the gamma and grayscale contrast `blend` (`text_blend`) packs.
 fn dwrite_coverage(a: f32, color: Color, blend: f32) -> f32 {
     const RATIOS: [[f32; 4]; 13] = [
         [0., 0., 0., 0.],
@@ -21483,8 +21619,9 @@ fn dwrite_coverage(a: f32, color: Color, blend: f32) -> f32 {
         [0.2031, -1.3864, 1.9851, -0.3501],
     ];
     let t = blend - 1.;
-    let q = (t / 16.).floor();
-    let row = (t - q * 16.).clamp(0., 12.) as usize;
+    let high = (t / 16.).floor();
+    let row = (t - high * 16.).clamp(0., 12.) as usize;
+    let q = high - (high / 256.).floor() * 256.;
     let (norm13, norm24) = (65536. / (255. * 255.), 256. / 255.);
     let r = RATIOS[row];
     let g = [r[0] * norm13, r[1] * norm24, r[2] * norm13, r[3] * norm24];

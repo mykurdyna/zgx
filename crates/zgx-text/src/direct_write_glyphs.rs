@@ -5,7 +5,8 @@
 //! symmetric smoothing for faces without any), as a coverage mask for the
 //! atlas. Its coverage is the plain coverage DirectWrite's own blending
 //! starts from; `draw.wgsl` corrects it for the text's colour with the
-//! system's gamma and contrast (`text_contrast`), as Direct2D does.
+//! system's gamma and contrast (`Params`), as Direct2D does. With ClearType
+//! on, the mask is ClearType's: red, green and blue coverage apart.
 //!
 //! Faces with colour glyphs (COLR, CBDT, sbix, SVG) stay swash's, whose
 //! colour outlines the atlas takes as they are.
@@ -52,16 +53,61 @@ pub fn available() -> bool {
     WRITER.with(Option::is_some)
 }
 
-/// The system's text gamma and enhanced contrast for grayscale text, as
-/// `IDWriteRenderingParams1` gives them (the ClearType Text Tuner's), for
-/// the renderer's blending: (1.8, 1.0) unless the user tuned them.
-pub fn rendering_params() -> Option<(f32, f32)> {
+/// How the system blends text, from `IDWriteRenderingParams1` (the ClearType
+/// Text Tuner's choices) and the font smoothing setting: what the
+/// renderer's blending needs (`draw.wgsl`'s `dwrite`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Params {
+    /// Text gamma: 1.8 unless tuned.
+    pub gamma: f32,
+    /// Enhanced contrast of grayscale text: 1.0 unless tuned.
+    pub grayscale_contrast: f32,
+    /// Enhanced contrast of ClearType text: 0.5 unless tuned.
+    pub cleartype_contrast: f32,
+    /// Whether glyphs are ClearType's (subpixel coverage, red green blue):
+    /// font smoothing set to ClearType, at a level above zero, on a
+    /// screen whose subpixels are in rows.
+    pub cleartype: bool,
+    /// Whether the screen's subpixels run blue green red.
+    pub bgr: bool,
+}
+
+/// The system's text blending (`Params`), read once.
+pub fn params() -> Option<Params> {
+    thread_local! {
+        static PARAMS: Option<Params> = read_params();
+    }
+    PARAMS.with(|params| *params)
+}
+
+fn read_params() -> Option<Params> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FE_FONTSMOOTHINGCLEARTYPE, SPI_GETFONTSMOOTHINGTYPE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+        SystemParametersInfoW,
+    };
     WRITER.with(|writer| {
         let writer = writer.as_ref()?;
-        // SAFETY: the parameters are a COM object owned here.
+        // SAFETY: the parameters are a COM object owned here; the
+        // smoothing type is written into a local.
         unsafe {
             let params: IDWriteRenderingParams1 = writer.factory.CreateRenderingParams().ok()?.cast().ok()?;
-            Some((params.GetGamma(), params.GetGrayscaleEnhancedContrast()))
+            let mut smoothing = 0u32;
+            let read = SystemParametersInfoW(
+                SPI_GETFONTSMOOTHINGTYPE,
+                0,
+                Some(std::ptr::from_mut(&mut smoothing).cast()),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            );
+            let geometry = params.GetPixelGeometry();
+            Some(Params {
+                gamma: params.GetGamma(),
+                grayscale_contrast: params.GetGrayscaleEnhancedContrast(),
+                cleartype_contrast: params.GetEnhancedContrast(),
+                cleartype: (read.is_err() || smoothing == FE_FONTSMOOTHINGCLEARTYPE)
+                    && params.GetClearTypeLevel() > 0.
+                    && geometry != DWRITE_PIXEL_GEOMETRY_FLAT,
+                bgr: geometry == DWRITE_PIXEL_GEOMETRY_BGR,
+            })
         }
     })
 }
@@ -173,6 +219,12 @@ fn draw(writer: &Writer, face: &IDWriteFontFace5, key: CacheKey) -> Option<Swash
     // SAFETY: the run borrows locals that outlive each call; its face is
     // released below, the run holding it in a `ManuallyDrop`.
     let image = unsafe {
+        let cleartype = params().is_some_and(|params| params.cleartype);
+        let antialias = if cleartype {
+            DWRITE_TEXT_ANTIALIAS_MODE_CLEARTYPE
+        } else {
+            DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE
+        };
         let mut mode = DWRITE_RENDERING_MODE1::default();
         let mut grid = DWRITE_GRID_FIT_MODE::default();
         let recommended = face.GetRecommendedRenderingMode(
@@ -196,40 +248,61 @@ fn draw(writer: &Writer, face: &IDWriteFontFace5, key: CacheKey) -> Option<Swash
             mode,
             DWRITE_MEASURING_MODE_NATURAL,
             grid,
-            DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+            antialias,
             key.x_bin.as_float(),
             key.y_bin.as_float(),
         );
-        analysis.ok().and_then(|analysis| mask(&analysis))
+        analysis.ok().and_then(|analysis| mask(&analysis, cleartype))
     };
     drop(std::mem::ManuallyDrop::into_inner(run.fontFace));
     image
 }
 
-/// The analysis' grayscale coverage, swash's way up: `top` above the
-/// baseline, rows from the top.
+/// The analysis' coverage, swash's way up: `top` above the baseline, rows
+/// from the top. Grayscale, one byte a pixel; or ClearType's (`cleartype`),
+/// four: red, green and blue coverage (in the screen's order) and their
+/// mean, which a renderer not blending them apart draws as grayscale.
 ///
 /// # Safety
 /// `analysis` is a live glyph run analysis.
-unsafe fn mask(analysis: &IDWriteGlyphRunAnalysis) -> Option<SwashImage> {
+unsafe fn mask(analysis: &IDWriteGlyphRunAnalysis, cleartype: bool) -> Option<SwashImage> {
+    let kind = if cleartype {
+        DWRITE_TEXTURE_CLEARTYPE_3x1
+    } else {
+        DWRITE_TEXTURE_ALIASED_1x1
+    };
     // SAFETY: the bounds and the texture are read into memory owned here.
     unsafe {
-        let bounds = analysis.GetAlphaTextureBounds(DWRITE_TEXTURE_ALIASED_1x1).ok()?;
+        let bounds = analysis.GetAlphaTextureBounds(kind).ok()?;
         let width = u32::try_from(bounds.right - bounds.left).unwrap_or(0);
         let height = u32::try_from(bounds.bottom - bounds.top).unwrap_or(0);
-        let mut data = vec![0u8; width as usize * height as usize];
+        let pixels = width as usize * height as usize;
+        let mut data = vec![0u8; pixels * if cleartype { 3 } else { 1 }];
         if !data.is_empty() {
-            analysis.CreateAlphaTexture(DWRITE_TEXTURE_ALIASED_1x1, &bounds, &mut data).ok()?;
+            analysis.CreateAlphaTexture(kind, &bounds, &mut data).ok()?;
         }
         let mut image = SwashImage::new();
-        image.content = SwashContent::Mask;
         image.placement = Placement {
             left: bounds.left,
             top: -bounds.top,
             width,
             height,
         };
-        image.data = data;
+        if cleartype {
+            let bgr = params().is_some_and(|params| params.bgr);
+            image.content = SwashContent::SubpixelMask;
+            image.data = data
+                .chunks_exact(3)
+                .flat_map(|rgb| {
+                    let [r, g, b] = if bgr { [rgb[2], rgb[1], rgb[0]] } else { [rgb[0], rgb[1], rgb[2]] };
+                    let mean = ((u16::from(r) + u16::from(g) + u16::from(b) + 1) / 3) as u8;
+                    [r, g, b, mean]
+                })
+                .collect();
+        } else {
+            image.content = SwashContent::Mask;
+            image.data = data;
+        }
         Some(image)
     }
 }
@@ -261,8 +334,13 @@ mod tests {
                 if theirs.placement.width == 0 {
                     continue;
                 }
-                let ink = |data: &[u8]| data.iter().map(|&a| u32::from(a)).sum::<u32>() as f32;
-                let (a, b) = (ink(&ours.data), ink(&theirs.data));
+                let ink = |image: &cosmic_text::SwashImage| match image.content {
+                    cosmic_text::SwashContent::SubpixelMask => {
+                        image.data.chunks_exact(4).map(|p| u32::from(p[3])).sum::<u32>() as f32
+                    }
+                    _ => image.data.iter().map(|&a| u32::from(a)).sum::<u32>() as f32,
+                };
+                let (a, b) = (ink(&ours), ink(&theirs));
                 assert!((ours.placement.left - theirs.placement.left).abs() <= 2, "left {:?} {:?}", ours.placement, theirs.placement);
                 assert!((ours.placement.top - theirs.placement.top).abs() <= 2, "top {:?} {:?}", ours.placement, theirs.placement);
                 assert!((a / b - 1.).abs() < 0.35, "ink {a} against {b}");

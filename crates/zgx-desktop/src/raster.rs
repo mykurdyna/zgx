@@ -1362,7 +1362,7 @@ impl Raster {
                         ),
                         cosmic_text::SwashContent::SubpixelMask => (
                             color,
-                            zgx_gpu::glyph_coverage(image.data[i * 4] as f32 / 255., color, 1.),
+                            zgx_gpu::glyph_coverage(image.data[i * 4 + 3] as f32 / 255., color, 1.),
                         ),
                     };
                     blend(

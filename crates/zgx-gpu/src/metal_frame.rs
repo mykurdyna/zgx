@@ -574,7 +574,7 @@ impl MetalFrame {
         let [full, basic, opaque] = pipelines.as_ref()?;
         match shading {
             Shading::Full => Some(full.clone()),
-            Shading::Basic => Some(basic.clone()),
+            Shading::Basic | Shading::Subpixel => Some(basic.clone()),
             Shading::Opaque => Some(opaque.clone()),
             _ => None,
         }
@@ -582,7 +582,7 @@ impl MetalFrame {
     fn pipeline(&self, shading: Shading) -> Pipeline {
         match shading {
             Shading::Full => self.full.clone(),
-            Shading::Basic => self.basic.clone(),
+            Shading::Basic | Shading::Subpixel => self.basic.clone(),
             Shading::Opaque => self.opaque.clone(),
             Shading::Polyline => self
                 .polyline_pipelines()
@@ -992,7 +992,9 @@ impl Frame {
                 | Shading::Behind,
                 true,
             ) => Bound::FullClear,
-            (Shading::Basic | Shading::Opaque, true) => Bound::Quads(Shading::Opaque),
+            (Shading::Basic | Shading::Subpixel | Shading::Opaque, true) => {
+                Bound::Quads(Shading::Opaque)
+            }
             (shading, false) if self.nearest => Bound::Nearest(shading),
             (shading, false) => Bound::Quads(shading),
         };

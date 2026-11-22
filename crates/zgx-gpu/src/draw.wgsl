@@ -20,22 +20,43 @@ fn firm(a:f32, k:f32)->f32 {return a+k*.67*a*(1.-a);}
 // how light the text is, with the system's gamma and contrast, as Windows
 // Terminal's dwrite_helpers.hlsl has it (MIT) and GPUI took it.
 // `viewport.w` is 1 + the gamma's row below + 16 times the grayscale
-// enhanced contrast in 64ths (`text_blend` in lib.rs).
+// enhanced contrast in 64ths + 4096 times ClearType's (`text_blend` in
+// lib.rs).
 const GAMMA_RATIOS=array<vec4<f32>,13>(
  vec4(0.,0.,0.,0.),vec4(.0166,-.0807,.2227,-.0751),vec4(.0350,-.1760,.4325,-.1370),
  vec4(.0543,-.2821,.6302,-.1876),vec4(.0739,-.3963,.8167,-.2287),vec4(.0933,-.5161,.9926,-.2616),
  vec4(.1121,-.6395,1.1588,-.2877),vec4(.1300,-.7649,1.3159,-.3080),vec4(.1469,-.8911,1.4644,-.3234),
  vec4(.1627,-1.0170,1.6051,-.3347),vec4(.1773,-1.1420,1.7385,-.3426),vec4(.1908,-1.2652,1.8650,-.3476),
  vec4(.2031,-1.3864,1.9851,-.3501));
-fn dwrite(a:f32, text:vec3<f32>)->f32 {
- let t=viewport.w-1.; let q=floor(t/16.); let row=u32(clamp(t-q*16.,0.,12.));
+// The system's gamma ratios and contrasts, from `viewport.w`: the ratios,
+// the grayscale contrast and ClearType's.
+fn dwrite_params()->array<vec4<f32>,2> {
+ let t=viewport.w-1.; let high=floor(t/16.); let row=u32(clamp(t-high*16.,0.,12.));
+ let cleartype=floor(high/256.); let grayscale=high-cleartype*256.;
  let norm13=65536./(255.*255.); let norm24=256./255.;
- let g=GAMMA_RATIOS[row]*vec4(norm13,norm24,norm13,norm24);
- let k=(q/64.)*saturate(4.*(.75-dot(text,vec3(.30,.59,.11))));
+ return array(GAMMA_RATIOS[row]*vec4(norm13,norm24,norm13,norm24),vec4(grayscale/64.,cleartype/64.,0.,0.));
+}
+// How much contrast dark text takes: none for light text.
+fn dwrite_contrast(contrast:f32, text:vec3<f32>)->f32 {return contrast*saturate(4.*(.75-dot(text,vec3(.30,.59,.11))));}
+fn dwrite(a:f32, text:vec3<f32>)->f32 {
+ let p=dwrite_params(); let g=p[0];
+ let k=dwrite_contrast(p[1].x,text);
  let f=dot(text,vec3(.25,.5,.25));
  let c=a*(k+1.)/(a*k+1.);
  return c+c*(1.-c)*((g.x*f+g.y)*c+(g.z*f+g.w));
 }
+// ClearType's: each subpixel's coverage `a` (red, green, blue) blended by
+// its own channel of the text's colour (Terminal's DWrite_ClearTypeBlend).
+fn dwrite3(a:vec3<f32>, text:vec3<f32>)->vec3<f32> {
+ let p=dwrite_params(); let g=p[0];
+ let k=dwrite_contrast(p[1].y,text);
+ let c=a*(k+1.)/(a*k+1.);
+ return c+c*(1.-c)*((g.x*text+g.y)*c+(g.z*text+g.w));
+}
+// A mask's colour factor: white, except ClearType's (`SUBPIXEL_GLYPH`),
+// whose red, green and blue are coverage, not colour: drawn here (not by
+// `fs_subpixel`) as grayscale, by their mean in alpha.
+fn mask_rgb(options_y:f32, tex:vec3<f32>)->vec3<f32> {return select(tex,vec3(1.),options_y>1.1&&options_y<1.5);}
 // A mask glyph's coverage as drawn: DirectWrite's blending where the
 // system's text draws it, else firmed below 2x (`firm`).
 fn coverage(a:f32, options_y:f32, text:vec3<f32>, k:f32)->f32 {
@@ -190,7 +211,7 @@ fn shade_texel(input:Out, given:vec4<f32>, has_texel:bool)->vec4<f32> {
  if v.options.y>0.5 {
    var tex=given; if !has_texel {tex=textureSample(atlas,tex_sampler,v.uv);}
    if v.options.y>1.5 {premultiplied=true; rgb=color.rgb*tex.rgb*color.a; color.a=color.a*tex.a;}
-   else {color=vec4(color.rgb*tex.rgb,color.a*coverage(tex.a,v.options.y,color.rgb,firmness(v.options.y,color.rgb)));}
+   else {color=vec4(color.rgb*mask_rgb(v.options.y,tex.rgb),color.a*coverage(tex.a,v.options.y,color.rgb,firmness(v.options.y,color.rgb)));}
  }
  if v.options.x>0. {let distance=min(v.point-v.fade.xy,v.fade.xy+v.fade.zw-v.point); let f=clamp(min(distance.x,distance.y)/v.options.x,0.,1.); color.a*=f; scale*=f;}
  // Rounded clips and `fade_edges` around it (see `Region`).
@@ -216,7 +237,7 @@ struct Basic { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32>,
 // Straight samples: colour.rgb * tex.rgb * (colour.a * tex.a). Premultiplied
 // ones already carry tex.a in tex.rgb: colour.rgb * tex.rgb * colour.a.
 fn basic(v:Basic)->vec4<f32> {
- if v.texture>0.5 {let tex=textureSample(atlas,tex_sampler,v.uv); let a=v.color.a*coverage(tex.a,v.texture,v.color.rgb,v.firmness); return vec4(v.color.rgb*tex.rgb*select(a,v.color.a,v.texture>1.5),a);}
+ if v.texture>0.5 {let tex=textureSample(atlas,tex_sampler,v.uv); let a=v.color.a*coverage(tex.a,v.texture,v.color.rgb,v.firmness); return vec4(v.color.rgb*mask_rgb(v.texture,tex.rgb)*select(a,v.color.a,v.texture>1.5),a);}
  return vec4(v.color.rgb*v.color.a,v.color.a);
 }
 @fragment fn fs_basic(v:Basic)->@location(0) vec4<f32> { return basic(v); }

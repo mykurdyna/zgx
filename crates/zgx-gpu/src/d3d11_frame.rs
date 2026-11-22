@@ -2417,9 +2417,9 @@ impl Frame<'_> {
             }
         }
         let bound = match (shading, clear) {
-            (Shading::Basic | Shading::Opaque, true) => Bound::Opaque,
+            (Shading::Basic | Shading::Subpixel | Shading::Opaque, true) => Bound::Opaque,
             (_, true) => Bound::FullClear,
-            (Shading::Basic, false) => Bound::Basic,
+            (Shading::Basic | Shading::Subpixel, false) => Bound::Basic,
             (Shading::Opaque, false) => Bound::Opaque,
             (Shading::Polyline, false) => Bound::Polyline,
             (Shading::SourceIn, false) => Bound::SourceIn,
