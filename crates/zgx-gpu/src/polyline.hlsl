@@ -225,30 +225,85 @@ float3 mask_rgb(float options_y_1, float3 tex)
     return (_e9 ? (1.0).xxx : tex);
 }
 
-float coverage(float a_3, float options_y_2, float3 text_4, float k_1)
+float srgb_decode(float v_7)
+{
+    return ((v_7 <= 0.04045) ? (v_7 / 12.92) : pow(((v_7 + 0.055) / 1.055), 2.4));
+}
+
+float srgb_encode(float v_8)
+{
+    return ((v_8 <= 0.0031308) ? (v_8 * 12.92) : ((1.055 * pow(max(v_8, 0.0), 0.41666666)) - 0.055));
+}
+
+float skia(float a_3, float level)
+{
+    float v_9 = (float)0;
+
+    float base = (floor((level / 32.0)) * 32.0);
+    float src = (((base + floor((base / 8.0))) + floor((base / 64.0))) / 255.0);
+    float dst_ = (1.0 - src);
+    const float _e19 = srgb_decode(dst_);
+    float c_2 = (a_3 + (((1.0 - a_3) * _e19) * a_3));
+    v_9 = c_2;
+    if ((abs((src - dst_)) >= 0.00390625)) {
+        const float _e30 = srgb_decode(src);
+        const float _e36 = srgb_encode(((_e30 * c_2) + ((1.0 - c_2) * _e19)));
+        v_9 = ((_e36 - dst_) / (src - dst_));
+    }
+    float _e40 = v_9;
+    return clamp((floor(((255.0 * _e40) + 0.5)) / 255.0), 0.0, 1.0);
+}
+
+float3 levels(float3 text_4)
+{
+    return round((saturate(text_4) * 255.0));
+}
+
+float luma(float3 text_5)
+{
+    const float3 _e1 = levels(text_5);
+    return floor(((((_e1.x * 54.0) + (_e1.y * 183.0)) + (_e1.z * 19.0)) / 256.0));
+}
+
+float coverage(float a_4, float options_y_2, float3 text_6, float k_1)
 {
     bool local_2 = (bool)0;
-    bool local_3 = (bool)0;
 
-    float _e6 = viewport.w;
-    if ((_e6 > 0.5)) {
-        local_2 = (options_y_2 > 1.1);
+    if ((options_y_2 > 1.1)) {
+        local_2 = (options_y_2 < 1.5);
     } else {
         local_2 = false;
     }
-    bool _e14 = local_2;
-    if (_e14) {
-        local_3 = (options_y_2 < 1.5);
-    } else {
-        local_3 = false;
+    bool _e11 = local_2;
+    if (_e11) {
+        float _e14 = viewport.w;
+        if ((_e14 > 0.5)) {
+            const float _e17 = dwrite(a_4, text_6);
+            return _e17;
+        }
+        float _e20 = viewport.w;
+        if ((_e20 < -0.5)) {
+            const float _e23 = luma(text_6);
+            const float _e24 = skia(a_4, _e23);
+            return _e24;
+        }
     }
-    bool _e20 = local_3;
-    if (_e20) {
-        const float _e21 = dwrite(a_3, text_4);
-        return _e21;
+    const float _e25 = firm(a_4, k_1);
+    return _e25;
+}
+
+float3 coverage3_(float3 a_5, float3 text_7)
+{
+    float _e4 = viewport.w;
+    if ((_e4 < -0.5)) {
+        const float3 _e7 = levels(text_7);
+        const float _e10 = skia(a_5.x, _e7.x);
+        const float _e13 = skia(a_5.y, _e7.y);
+        const float _e16 = skia(a_5.z, _e7.z);
+        return float3(_e10, _e13, _e16);
     }
-    const float _e22 = firm(a_3, k_1);
-    return _e22;
+    const float3 _e18 = dwrite3_(a_5, text_7);
+    return _e18;
 }
 
 float rounded(float4 b, float4 r, float feather, float2 p)
@@ -286,23 +341,23 @@ Region ConstructRegion(float4 arg0, float4 arg1, float4 arg2, float4 arg3, float
 
 float4 tinted(float index, float4 premultiplied)
 {
-    bool local_4 = (bool)0;
+    bool local_3 = (bool)0;
 
     if ((index < 0.5)) {
         return premultiplied;
     }
     Region g_2 = ConstructRegion(asfloat(regions.Load4((naga_f2u32(index) - 1u)*160+0)), asfloat(regions.Load4((naga_f2u32(index) - 1u)*160+16)), asfloat(regions.Load4((naga_f2u32(index) - 1u)*160+32)), asfloat(regions.Load4((naga_f2u32(index) - 1u)*160+48)), asfloat(regions.Load4((naga_f2u32(index) - 1u)*160+64)), asfloat(regions.Load4((naga_f2u32(index) - 1u)*160+80)), asfloat(regions.Load4((naga_f2u32(index) - 1u)*160+96)), asfloat(regions.Load4((naga_f2u32(index) - 1u)*160+112)), asfloat(regions.Load4((naga_f2u32(index) - 1u)*160+128)), asfloat(regions.Load4((naga_f2u32(index) - 1u)*160+144)));
     if (!((g_2.tint.x < 0.5))) {
-        local_4 = (premultiplied.w <= 0.0);
+        local_3 = (premultiplied.w <= 0.0);
     } else {
-        local_4 = true;
+        local_3 = true;
     }
-    bool _e21 = local_4;
+    bool _e21 = local_3;
     if (_e21) {
         return premultiplied;
     }
-    float4 c_2 = float4((premultiplied.xyz / (premultiplied.w).xxx), 1.0);
-    float3 rgb_1 = clamp(float3(dot(g_2.color0_, c_2), dot(g_2.color1_, c_2), dot(g_2.color2_, c_2)), (0.0).xxx, (1.0).xxx);
+    float4 c_3 = float4((premultiplied.xyz / (premultiplied.w).xxx), 1.0);
+    float3 rgb_1 = clamp(float3(dot(g_2.color0_, c_3), dot(g_2.color1_, c_3), dot(g_2.color2_, c_3)), (0.0).xxx, (1.0).xxx);
     return float4((rgb_1 * premultiplied.w), premultiplied.w);
 }
 
@@ -367,68 +422,68 @@ float2 centred(float2 at, float4 box)
 
 float4 shade_texel(Out input, float4 given, bool has_texel)
 {
-    Out v_7 = (Out)0;
+    Out v_10 = (Out)0;
     float4 color_1 = (float4)0;
+    bool local_4 = (bool)0;
     bool local_5 = (bool)0;
-    bool local_6 = (bool)0;
     float corner = (float)0;
-    bool local_7 = (bool)0;
+    bool local_6 = (bool)0;
     bool premultiplied_1 = false;
     float3 rgb = (0.0).xxx;
     float scale = 1.0;
     float4 tex_1 = (float4)0;
 
-    v_7 = input;
-    float _e6 = v_7.options.z;
+    v_10 = input;
+    float _e6 = v_10.options.z;
     if ((_e6 < 0.5)) {
-        float4 _e11 = v_7.position;
+        float4 _e11 = v_10.position;
         float _e15 = viewport.z;
-        v_7.point_ = (_e11.xy / (_e15).xx);
+        v_10.point_ = (_e11.xy / (_e15).xx);
     }
-    float4 _e19 = v_7.color;
+    float4 _e19 = v_10.color;
     color_1 = _e19;
-    float _e23 = v_7.options.z;
+    float _e23 = v_10.options.z;
     if ((_e23 < 0.5)) {
-        float _e30 = v_7.shape.w;
+        float _e30 = v_10.shape.w;
         if (!((_e30 > 0.5))) {
-            float _e38 = v_7.shape.z;
-            local_6 = (_e38 > 0.0);
+            float _e38 = v_10.shape.z;
+            local_5 = (_e38 > 0.0);
         } else {
-            local_6 = true;
+            local_5 = true;
         }
-        bool _e42 = local_6;
-        local_5 = _e42;
+        bool _e42 = local_5;
+        local_4 = _e42;
     } else {
-        local_5 = false;
+        local_4 = false;
     }
-    bool _e44 = local_5;
+    bool _e44 = local_4;
     if (_e44) {
-        float _e47 = v_7.shape.x;
+        float _e47 = v_10.shape.x;
         corner = _e47;
-        float _e51 = v_7.options.w;
+        float _e51 = v_10.options.w;
         if ((_e51 > 0.5)) {
-            float _e56 = v_7.point_.x;
-            float _e59 = v_7.fade.x;
-            float _e62 = v_7.fade.z;
+            float _e56 = v_10.point_.x;
+            float _e59 = v_10.fade.x;
+            float _e62 = v_10.fade.z;
             bool right = (_e56 > (_e59 + (_e62 * 0.5)));
-            float _e69 = v_7.point_.y;
-            float _e72 = v_7.fade.y;
-            float _e75 = v_7.fade.w;
+            float _e69 = v_10.point_.y;
+            float _e72 = v_10.fade.y;
+            float _e75 = v_10.fade.w;
             bool bottom = (_e69 > (_e72 + (_e75 * 0.5)));
-            float _e82 = v_7.border.x;
-            float _e85 = v_7.border.y;
-            float _e89 = v_7.border.w;
-            float _e92 = v_7.border.z;
+            float _e82 = v_10.border.x;
+            float _e85 = v_10.border.y;
+            float _e89 = v_10.border.w;
+            float _e92 = v_10.border.z;
             corner = (bottom ? (right ? _e92 : _e89) : (right ? _e85 : _e82));
         }
         float _e95 = corner;
-        float _e98 = v_7.fade.z;
-        float _e101 = v_7.fade.w;
+        float _e98 = v_10.fade.z;
+        float _e101 = v_10.fade.w;
         float radius_1 = clamp(_e95, 0.0, (min(_e98, _e101) * 0.5));
-        float4 _e108 = v_7.position;
-        float4 _e111 = v_7.fade;
+        float4 _e108 = v_10.position;
+        float4 _e111 = v_10.fade;
         const float2 _e112 = centred(_e108.xy, _e111);
-        float4 _e114 = v_7.fade;
+        float4 _e114 = v_10.fade;
         float2 q_1 = (_e112 - ((_e114.zw * 0.5) - (radius_1).xx));
         float distance_ = ((length(max(q_1, (0.0).xx)) + min(max(q_1.x, q_1.y), 0.0)) - radius_1);
         float2 outside = max(q_1, (0.0).xx);
@@ -436,45 +491,45 @@ float4 shade_texel(Out input, float4 given, bool has_texel)
         float2 gradient = ((reach > 0.0) ? (outside / (max(reach, 1e-20)).xx) : ((q_1.x > q_1.y) ? float2(1.0, 0.0) : float2(0.0, 1.0)));
         float _e155 = viewport.z;
         float2 slope = (gradient / (_e155).xx);
-        float _e160 = v_7.shape.y;
+        float _e160 = v_10.shape.y;
         if ((_e160 < 0.0)) {
-            float _e165 = v_7.shape.x;
-            uint a_5 = naga_f2u32(_e165);
-            float _e169 = v_7.shape.z;
+            float _e165 = v_10.shape.x;
+            uint a_7 = naga_f2u32(_e165);
+            float _e169 = v_10.shape.z;
             uint b_3 = naga_f2u32(_e169);
-            float4 sides = (float4(float((a_5 & 4095u)), float((a_5 >> 12u)), float((b_3 & 4095u)), float((b_3 >> 12u))) / (16.0).xxxx);
-            float _e189 = v_7.point_.x;
-            float _e192 = v_7.fade.x;
-            float _e195 = v_7.fade.z;
+            float4 sides = (float4(float((a_7 & 4095u)), float((a_7 >> 12u)), float((b_3 & 4095u)), float((b_3 >> 12u))) / (16.0).xxxx);
+            float _e189 = v_10.point_.x;
+            float _e192 = v_10.fade.x;
+            float _e195 = v_10.fade.z;
             bool right_1 = (_e189 > (_e192 + (_e195 * 0.5)));
-            float _e202 = v_7.point_.y;
-            float _e205 = v_7.fade.y;
-            float _e208 = v_7.fade.w;
+            float _e202 = v_10.point_.y;
+            float _e205 = v_10.fade.y;
+            float _e208 = v_10.fade.w;
             bool bottom_1 = (_e202 > (_e205 + (_e208 * 0.5)));
             float across = (right_1 ? sides.y : sides.w);
             float down = (bottom_1 ? sides.z : sides.x);
-            float4 _e220 = v_7.fade;
-            float4 _e225 = v_7.fade;
+            float4 _e220 = v_10.fade;
+            float4 _e225 = v_10.fade;
             float4 box_2 = float4((_e220.xy + sides.wx), max(((_e225.zw - sides.wx) - sides.yz), (0.0).xx));
             float inner_radius = clamp((radius_1 - ((across + down) * 0.5)), 0.0, (min(box_2.z, box_2.w) * 0.5));
-            float4 _e247 = v_7.position;
+            float4 _e247 = v_10.position;
             const float2 _e249 = centred(_e247.xy, box_2);
             float2 iq = (_e249 - ((box_2.zw * 0.5) - (inner_radius).xx));
             float inside = ((length(max(iq, (0.0).xx)) + min(max(iq.x, iq.y), 0.0)) - inner_radius);
             float aa = max((slope.x + slope.y), 0.5);
             if ((box_2.z > 0.0)) {
-                local_7 = (box_2.w > 0.0);
+                local_6 = (box_2.w > 0.0);
             } else {
-                local_7 = false;
+                local_6 = false;
             }
-            bool _e287 = local_7;
+            bool _e287 = local_6;
             float hollow = (_e287 ? clamp((0.5 - (inside / aa)), 0.0, 1.0) : 0.0);
             float _e291 = color_1.w;
             color_1.w = (_e291 * max((clamp((0.5 - (distance_ / aa)), 0.0, 1.0) - hollow), 0.0));
         } else {
-            float _e304 = v_7.shape.z;
+            float _e304 = v_10.shape.z;
             if ((_e304 > 0.0)) {
-                float _e309 = v_7.shape.z;
+                float _e309 = v_10.shape.z;
                 float x_1 = (distance_ / (_e309 * 1.4142135));
                 float x2_ = (x_1 * x_1);
                 float e_1 = (sign(x_1) * sqrt((1.0 - exp(((-(x2_) * (1.2732395 + (0.147 * x2_))) / (1.0 + (0.147 * x2_)))))));
@@ -485,29 +540,29 @@ float4 shade_texel(Out input, float4 given, bool has_texel)
                 float dy = slope.y;
                 float aa_1 = max(((radius_1 <= 0.0) ? max(dx, dy) : (dx + dy)), 0.5);
                 float outer = clamp((0.5 - (distance_ / aa_1)), 0.0, 1.0);
-                float _e355 = v_7.shape.y;
+                float _e355 = v_10.shape.y;
                 float inner = clamp((0.5 - ((distance_ + _e355) / aa_1)), 0.0, 1.0);
-                float _e365 = v_7.border.w;
+                float _e365 = v_10.border.w;
                 float ba = (_e365 * (outer - inner));
                 float _e369 = color_1.w;
                 float fa = (_e369 * (outer - ba));
                 float alpha = (ba + fa);
-                float4 _e374 = v_7.border;
+                float4 _e374 = v_10.border;
                 float4 _e377 = color_1;
                 float3 rgb_2 = ((alpha > 0.0) ? (((_e374.xyz * ba) + (_e377.xyz * fa)) / (max(alpha, 1e-5)).xxx) : (0.0).xxx);
                 color_1 = float4(rgb_2, alpha);
             }
         }
     }
-    float _e400 = v_7.options.y;
+    float _e400 = v_10.options.y;
     if ((_e400 > 0.5)) {
         tex_1 = given;
         if (!(has_texel)) {
-            float2 _e408 = v_7.uv;
+            float2 _e408 = v_10.uv;
             float4 _e409 = atlas.Sample(tex_sampler, _e408);
             tex_1 = _e409;
         }
-        float _e412 = v_7.options.y;
+        float _e412 = v_10.options.y;
         if ((_e412 > 1.5)) {
             premultiplied_1 = true;
             float4 _e416 = color_1;
@@ -519,46 +574,46 @@ float4 shade_texel(Out input, float4 given, bool has_texel)
             color_1.w = (_e426 * _e428);
         } else {
             float4 _e430 = color_1;
-            float _e434 = v_7.options.y;
+            float _e434 = v_10.options.y;
             float4 _e435 = tex_1;
             const float3 _e437 = mask_rgb(_e434, _e435.xyz);
             float _e440 = color_1.w;
             float _e442 = tex_1.w;
-            float _e445 = v_7.options.y;
+            float _e445 = v_10.options.y;
             float4 _e446 = color_1;
-            float _e450 = v_7.options.y;
+            float _e450 = v_10.options.y;
             float4 _e451 = color_1;
             const float _e453 = firmness(_e450, _e451.xyz);
             const float _e454 = coverage(_e442, _e445, _e446.xyz, _e453);
             color_1 = float4((_e430.xyz * _e437), (_e440 * _e454));
         }
     }
-    float _e459 = v_7.options.x;
+    float _e459 = v_10.options.x;
     if ((_e459 > 0.0)) {
-        float2 _e463 = v_7.point_;
-        float4 _e465 = v_7.fade;
-        float4 _e469 = v_7.fade;
-        float4 _e472 = v_7.fade;
-        float2 _e476 = v_7.point_;
+        float2 _e463 = v_10.point_;
+        float4 _e465 = v_10.fade;
+        float4 _e469 = v_10.fade;
+        float4 _e472 = v_10.fade;
+        float2 _e476 = v_10.point_;
         float2 distance_1 = min((_e463 - _e465.xy), ((_e469.xy + _e472.zw) - _e476));
-        float _e484 = v_7.options.x;
+        float _e484 = v_10.options.x;
         float f_2 = clamp((min(distance_1.x, distance_1.y) / _e484), 0.0, 1.0);
         float _e490 = color_1.w;
         color_1.w = (_e490 * f_2);
         float _e492 = scale;
         scale = (_e492 * f_2);
     }
-    float _e496 = v_7.mask.x;
+    float _e496 = v_10.mask.x;
     if ((_e496 > 0.5)) {
-        float _e501 = v_7.mask.x;
-        float4 _e503 = v_7.position;
+        float _e501 = v_10.mask.x;
+        float4 _e503 = v_10.position;
         const float _e505 = region(_e501, _e503.xy);
         float _e507 = color_1.w;
         color_1.w = (_e507 * _e505);
         float _e509 = scale;
         scale = (_e509 * _e505);
     }
-    float _e513 = v_7.mask.x;
+    float _e513 = v_10.mask.x;
     float4 _e514 = color_1;
     float _e517 = color_1.w;
     float _e520 = color_1.w;
@@ -576,39 +631,39 @@ float4 shade(Out input_1)
     return _e4;
 }
 
-float4 basic(Basic v_8)
+float4 basic(Basic v_11)
 {
-    if ((v_8.texture_ > 0.5)) {
-        float4 tex_2 = atlas.Sample(tex_sampler, v_8.uv);
-        const float _e15 = coverage(tex_2.w, v_8.texture_, v_8.color.xyz, v_8.firmness);
-        float a_6 = (v_8.color.w * _e15);
-        const float3 _e21 = mask_rgb(v_8.texture_, tex_2.xyz);
-        return float4(((v_8.color.xyz * _e21) * ((v_8.texture_ > 1.5) ? v_8.color.w : a_6)), a_6);
+    if ((v_11.texture_ > 0.5)) {
+        float4 tex_2 = atlas.Sample(tex_sampler, v_11.uv);
+        const float _e15 = coverage(tex_2.w, v_11.texture_, v_11.color.xyz, v_11.firmness);
+        float a_8 = (v_11.color.w * _e15);
+        const float3 _e21 = mask_rgb(v_11.texture_, tex_2.xyz);
+        return float4(((v_11.color.xyz * _e21) * ((v_11.texture_ > 1.5) ? v_11.color.w : a_8)), a_8);
     }
-    return float4((v_8.color.xyz * v_8.color.w), v_8.color.w);
+    return float4((v_11.color.xyz * v_11.color.w), v_11.color.w);
 }
 
-float zgx_distance(float2 p_2, float2 a_4, float2 b_2)
+float zgx_distance(float2 p_2, float2 a_6, float2 b_2)
 {
-    float2 pa = (p_2 - a_4);
-    float2 ba_1 = (b_2 - a_4);
+    float2 pa = (p_2 - a_6);
+    float2 ba_1 = (b_2 - a_6);
     return length((pa - (ba_1 * clamp((dot(pa, ba_1) / max(dot(ba_1, ba_1), 1e-12)), 0.0, 1.0))));
 }
 
-float zgx_join(float d, float2 p_3, float2 v_9, float2 d0_, float2 d1_, float h, float join, float limit)
+float zgx_join(float d, float2 p_3, float2 v_12, float2 d0_, float2 d1_, float h, float join, float limit)
 {
+    bool local_7 = (bool)0;
     bool local_8 = (bool)0;
     bool local_9 = (bool)0;
     bool local_10 = (bool)0;
-    bool local_11 = (bool)0;
 
     float turn = ((d0_.x * d1_.y) - (d0_.y * d1_.x));
     if (!((join > 1.5))) {
-        local_8 = (abs(turn) < 1e-6);
+        local_7 = (abs(turn) < 1e-6);
     } else {
-        local_8 = true;
+        local_7 = true;
     }
-    bool _e24 = local_8;
+    bool _e24 = local_7;
     if (_e24) {
         return d;
     }
@@ -617,35 +672,35 @@ float zgx_join(float d, float2 p_3, float2 v_9, float2 d0_, float2 d1_, float h,
     float2 n1_ = (float2(-(d1_.y), d1_.x) * side);
     float2 m = normalize((n0_ + n1_));
     float cos_half = sqrt(max(((1.0 + dot(n0_, n1_)) * 0.5), 0.0));
-    float2 q_2 = (p_3 - v_9);
+    float2 q_2 = (p_3 - v_12);
     if ((join < 0.5)) {
-        local_9 = (cos_half > 1e-6);
+        local_8 = (cos_half > 1e-6);
+    } else {
+        local_8 = false;
+    }
+    bool _e58 = local_8;
+    if (_e58) {
+        local_9 = ((1.0 / cos_half) <= limit);
     } else {
         local_9 = false;
     }
-    bool _e58 = local_9;
-    if (_e58) {
-        local_10 = ((1.0 / cos_half) <= limit);
-    } else {
-        local_10 = false;
-    }
-    bool _e65 = local_10;
+    bool _e65 = local_9;
     if (_e65) {
-        float2 a_7 = (v_9 + (n0_ * h));
-        float2 b_4 = (v_9 + (n1_ * h));
-        float2 tip = (v_9 + (m * (h / cos_half)));
+        float2 a_9 = (v_12 + (n0_ * h));
+        float2 b_4 = (v_12 + (n1_ * h));
+        float2 tip = (v_12 + (m * (h / cos_half)));
         float inside_1 = max(max((dot(q_2, n0_) - h), (dot(q_2, n1_) - h)), max(-(dot(q_2, d0_)), dot(q_2, d1_)));
-        const float _e83 = zgx_distance(p_3, a_7, tip);
+        const float _e83 = zgx_distance(p_3, a_9, tip);
         const float _e84 = zgx_distance(p_3, tip, b_4);
         float kite = ((inside_1 <= 0.0) ? inside_1 : min(_e83, _e84));
         return min(d, kite);
     }
     if (!((dot(q_2, d0_) < 0.0))) {
-        local_11 = (dot(q_2, d1_) > 0.0);
+        local_10 = (dot(q_2, d1_) > 0.0);
     } else {
-        local_11 = true;
+        local_10 = true;
     }
-    bool _e100 = local_11;
+    bool _e100 = local_10;
     if (_e100) {
         return d;
     }
@@ -707,33 +762,33 @@ float zgx_round_box(float2 p_5, float4 box_1, float4 corners)
     return ((length(max(q_4, (0.0).xx)) + min(max(q_4.x, q_4.y), 0.0)) - r_1);
 }
 
-float4 zgx_inset(Out v_10)
+float4 zgx_inset(Out v_13)
 {
     float4 color_2 = (float4)0;
 
     float _e5 = viewport.z;
-    float2 p_7 = (v_10.position.xy / (_e5).xx);
-    uint first_1 = (naga_f2u32(v_10.mask.y) - 1u);
+    float2 p_7 = (v_13.position.xy / (_e5).xx);
+    uint first_1 = (naga_f2u32(v_13.mask.y) - 1u);
     float2 offset = asfloat(points.Load2(first_1*8));
     float sigma = asfloat(points.Load(0+(first_1 + 1u)*8));
     float spread = asfloat(points.Load(4+(first_1 + 1u)*8));
-    float4 hole = float4(((v_10.fade.xy + offset) + (spread).xx), max((v_10.fade.zw - ((spread * 2.0)).xx), (0.0).xx));
-    const float _e49 = zgx_round_box(p_7, hole, max((v_10.border - (spread).xxxx), (0.0).xxxx));
+    float4 hole = float4(((v_13.fade.xy + offset) + (spread).xx), max((v_13.fade.zw - ((spread * 2.0)).xx), (0.0).xx));
+    const float _e49 = zgx_round_box(p_7, hole, max((v_13.border - (spread).xxxx), (0.0).xxxx));
     float x_2 = (_e49 / (sigma * 1.4142135));
     float x2_1 = (x_2 * x_2);
     float e_2 = (sign(x_2) * sqrt((1.0 - exp(((-(x2_1) * (1.2732395 + (0.147 * x2_1))) / (1.0 + (0.147 * x2_1)))))));
     float _e73 = viewport.z;
     float aa_2 = max((1.0 / _e73), 0.5);
-    const float _e80 = zgx_round_box(p_7, v_10.fade, v_10.border);
+    const float _e80 = zgx_round_box(p_7, v_13.fade, v_13.border);
     float cover = clamp((0.5 - (_e80 / aa_2)), 0.0, 1.0);
-    color_2 = ((float4((v_10.color.xyz * v_10.color.w), v_10.color.w) * (0.5 + (0.5 * e_2))) * cover);
-    if ((v_10.mask.x > 0.5)) {
+    color_2 = ((float4((v_13.color.xyz * v_13.color.w), v_13.color.w) * (0.5 + (0.5 * e_2))) * cover);
+    if ((v_13.mask.x > 0.5)) {
         float4 _e106 = color_2;
-        const float _e111 = region(v_10.mask.x, v_10.position.xy);
+        const float _e111 = region(v_13.mask.x, v_13.position.xy);
         color_2 = (_e106 * _e111);
     }
     float4 _e115 = color_2;
-    const float4 _e116 = tinted(v_10.mask.x, _e115);
+    const float4 _e116 = tinted(v_13.mask.x, _e115);
     return _e116;
 }
 
@@ -808,13 +863,13 @@ float4 zgx_polyline(Out input_2)
             }
             {
                 uint _e87 = k_5;
-                float2 a_8 = asfloat(points.Load2(((first_2 + _e87) - 1u)*8));
+                float2 a_10 = asfloat(points.Load2(((first_2 + _e87) - 1u)*8));
                 uint _e94 = k_5;
                 float2 b_5 = asfloat(points.Load2((first_2 + _e94)*8));
                 uint _e99 = k_5;
-                float2 c_3 = asfloat(points.Load2(((first_2 + _e99) + 1u)*8));
+                float2 c_4 = asfloat(points.Load2(((first_2 + _e99) + 1u)*8));
                 float _e105 = d_2;
-                const float _e110 = zgx_join(_e105, p_8, b_5, normalize((b_5 - a_8)), normalize((c_3 - b_5)), h_2, join_1, limit_1);
+                const float _e110 = zgx_join(_e105, p_8, b_5, normalize((b_5 - a_10)), normalize((c_4 - b_5)), h_2, join_1, limit_1);
                 d_2 = _e110;
             }
         }

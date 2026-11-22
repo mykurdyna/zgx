@@ -19,12 +19,14 @@ mod core_text_glyphs;
 pub mod direct_write_glyphs;
 #[doc(hidden)]
 pub mod font_cache;
+mod look;
 pub mod prepared;
 pub mod text;
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
 pub use core_text_glyphs::core_text_glyph;
 pub use font_cache::set_desktop_sans_serif;
+pub use look::{TextLook, set_text_look, text_look};
 
 /// Shapes using exactly the same font selection and line metrics as the renderer.
 pub fn measure_text(

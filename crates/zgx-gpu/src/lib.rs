@@ -8,7 +8,7 @@ use std::{cell::RefCell, fmt, rc::Rc, sync::Arc};
 use zgx::scene::{Color, NodeId, NodeKind, Rect, Scene};
 // Text shaping and measuring, in a crate of their own (zgx-text) that a host
 // with no renderer links alone; here as they always were.
-pub use zgx_text::{TextServices, measure_text, prepared, text};
+pub use zgx_text::{TextLook, TextServices, measure_text, prepared, set_text_look, text, text_look};
 use zgx_text::{default_text_services, font_cache, install_text};
 
 mod bands;
@@ -1694,9 +1694,17 @@ const SHARP_TEXT_BELOW: f32 = 2.;
 /// (DirectWrite, Windows): `viewport.w` for `draw.wgsl`'s `dwrite`, 1 + the
 /// row of the system's text gamma in its table (1.0 to 2.2 by tenths) + 16
 /// times its grayscale enhanced contrast in 64ths + 4096 times ClearType's
-/// (each up to 255/64). 0 elsewhere: masks firm as `firm` has it.
+/// (each up to 255/64). -1 for Chromium's look (`TextLook::Chromium`):
+/// Skia's gamma (`draw.wgsl`'s `skia`). 0 elsewhere: masks firm as `firm`
+/// has it.
 pub fn text_blend() -> f32 {
     static BLEND: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
+        #[cfg(windows)]
+        if zgx_text::direct_write_glyphs::available()
+            && zgx_text::text_look() == zgx_text::TextLook::Chromium
+        {
+            return -1.;
+        }
         #[cfg(windows)]
         if zgx_text::direct_write_glyphs::available()
             && let Some(params) = zgx_text::direct_write_glyphs::params()
@@ -1738,7 +1746,7 @@ fn glyph_texture(color: bool, subpixel: bool, scale: f32) -> f32 {
     if subpixel {
         return SUBPIXEL_GLYPH;
     }
-    if !color && (scale < SHARP_TEXT_BELOW || text_blend() > 0.) {
+    if !color && (scale < SHARP_TEXT_BELOW || text_blend() != 0.) {
         FIRM_GLYPH
     } else {
         1.
@@ -21600,6 +21608,26 @@ pub fn glyph_image(
 ) -> Option<cosmic_text::SwashImage> {
     text::glyph_image(swash, fonts, key)
 }
+/// `draw.wgsl`'s `skia`: coverage `a` of a grayscale glyph in `color` as
+/// Chromium's Skia blends it (`TextLook::Chromium`).
+fn skia_coverage(a: f32, color: Color) -> f32 {
+    let decode = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    let encode = |v: f32| {
+        if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.max(0.).powf(1. / 2.4) - 0.055 }
+    };
+    let luma = (u32::from(color.0) * 54 + u32::from(color.1) * 183 + u32::from(color.2) * 19) >> 8;
+    let base = (luma >> 5) << 5;
+    let src = (base | base >> 3 | base >> 6) as f32 / 255.;
+    let dst = 1. - src;
+    let lin_dst = decode(dst);
+    let c = a + (1. - a) * lin_dst * a;
+    let v = if (src - dst).abs() < 1. / 256. {
+        c
+    } else {
+        (encode(decode(src) * c + (1. - c) * lin_dst) - dst) / (src - dst)
+    };
+    ((255. * v + 0.5).floor() / 255.).clamp(0., 1.)
+}
 /// `draw.wgsl`'s `dwrite`: coverage `a` in `color` as DirectWrite blends it,
 /// with the gamma and grayscale contrast `blend` (`text_blend`) packs.
 fn dwrite_coverage(a: f32, color: Color, blend: f32) -> f32 {
@@ -21638,6 +21666,9 @@ pub fn glyph_coverage(a: f32, color: Color, scale: f32) -> f32 {
     let blend = text_blend();
     if blend > 0. {
         return dwrite_coverage(a, color, blend);
+    }
+    if blend < 0. {
+        return skia_coverage(a, color);
     }
     if scale >= SHARP_TEXT_BELOW {
         return a;

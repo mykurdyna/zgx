@@ -57,11 +57,41 @@ fn dwrite3(a:vec3<f32>, text:vec3<f32>)->vec3<f32> {
 // whose red, green and blue are coverage, not colour: drawn here (not by
 // `fs_subpixel`) as grayscale, by their mean in alpha.
 fn mask_rgb(options_y:f32, tex:vec3<f32>)->vec3<f32> {return select(tex,vec3(1.),options_y>1.1&&options_y<1.5);}
-// A mask glyph's coverage as drawn: DirectWrite's blending where the
-// system's text draws it, else firmed below 2x (`firm`).
+// Chromium's text (`viewport.w` -1, `TextLook::Chromium`): Skia's gamma
+// as Chromium sets it on Windows (`SkMaskGamma`, sRGB, contrast 1), after
+// anomalyco/rune's skia_gamma.rs (MIT). The coverage of text whose 8-bit
+// level (a channel, or Rec. 709 luma) falls in one of eight buckets, as a
+// linear blend over the bucket's opposite would show it, undone through
+// the encoded blend the target does.
+fn srgb_decode(v:f32)->f32 {return select(pow((v+.055)/1.055,2.4),v/12.92,v<=.04045);}
+fn srgb_encode(v:f32)->f32 {return select(1.055*pow(max(v,0.),1./2.4)-.055,v*12.92,v<=.0031308);}
+fn skia(a:f32, level:f32)->f32 {
+ let base=floor(level/32.)*32.;
+ let src=(base+floor(base/8.)+floor(base/64.))/255.; let dst=1.-src;
+ let lin_dst=srgb_decode(dst);
+ let c=a+(1.-a)*lin_dst*a;
+ var v=c;
+ if abs(src-dst)>=1./256. {v=(srgb_encode(srgb_decode(src)*c+(1.-c)*lin_dst)-dst)/(src-dst);}
+ return clamp(floor(255.*v+.5)/255.,0.,1.);
+}
+// The 8-bit levels Skia reads of a text's colour: each channel's.
+fn levels(text:vec3<f32>)->vec3<f32> {return round(saturate(text)*255.);}
+// A grayscale mask's: Rec. 709 luma of the 8-bit colour.
+fn luma(text:vec3<f32>)->f32 {let b=levels(text); return floor((b.r*54.+b.g*183.+b.b*19.)/256.);}
+// A mask glyph's coverage as drawn: Chromium's or DirectWrite's blending
+// where the system draws glyphs, else firmed below 2x (`firm`).
 fn coverage(a:f32, options_y:f32, text:vec3<f32>, k:f32)->f32 {
- if viewport.w>.5 && options_y>1.1 && options_y<1.5 {return dwrite(a,text);}
+ if options_y>1.1 && options_y<1.5 {
+  if viewport.w>.5 {return dwrite(a,text);}
+  if viewport.w<-.5 {return skia(a,luma(text));}
+ }
  return firm(a,k);
+}
+// A ClearType glyph's coverage per subpixel: Chromium's, each channel's
+// table by its own level, or DirectWrite's (`dwrite3`).
+fn coverage3(a:vec3<f32>, text:vec3<f32>)->vec3<f32> {
+ if viewport.w<-.5 {let l=levels(text); return vec3(skia(a.r,l.r),skia(a.g,l.g),skia(a.b,l.b));}
+ return dwrite3(a,text);
 }
 // Group 1: one immutable buffer per viewport size, so layers never rewrite it.
 @group(1) @binding(0) var<uniform> viewport:vec4<f32>;

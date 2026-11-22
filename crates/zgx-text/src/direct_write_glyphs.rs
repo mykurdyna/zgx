@@ -24,12 +24,23 @@ struct Writer {
 /// A face at one weight and optical size.
 type FaceKey = (cosmic_text::fontdb::ID, u16, u16, bool);
 
+/// A font's resource and what Skia's choice of rendering mode reads of it
+/// (`TextLook::Chromium`).
+#[derive(Clone)]
+struct Source {
+    resource: IDWriteFontResource,
+    /// Its `gasp` ranges (largest ppem, behaviour), version 1 or later.
+    gasp: Option<Vec<(u16, u16)>>,
+    /// Whether it has TrueType bytecode (`maxp.maxSizeOfInstructions`).
+    hinted: bool,
+}
+
 #[derive(Default)]
 struct Cache {
     /// Each face's font resource (None: DirectWrite can't read it).
-    resources: HashMap<cosmic_text::fontdb::ID, Option<IDWriteFontResource>>,
+    resources: HashMap<cosmic_text::fontdb::ID, Option<Source>>,
     /// Faces made from them at a weight, optical size and slant.
-    faces: HashMap<FaceKey, Option<IDWriteFontFace5>>,
+    faces: HashMap<FaceKey, Option<(IDWriteFontFace5, Source)>>,
 }
 
 thread_local! {
@@ -130,14 +141,19 @@ pub(crate) fn glyph_image(fonts: &mut FontSystem, key: CacheKey) -> Option<Swash
     if colour(&font) {
         return None;
     }
-    let face = WRITER.with(|writer| {
+    let (face, source) = WRITER.with(|writer| {
         let writer = writer.as_ref()?;
         CACHE.with(|cache| face_for(&mut cache.borrow_mut(), writer, fonts, key))
     })?;
-    WRITER.with(|writer| draw(writer.as_ref()?, &face, key))
+    WRITER.with(|writer| draw(writer.as_ref()?, &face, &source, key))
 }
 
-fn face_for(cache: &mut Cache, writer: &Writer, fonts: &mut FontSystem, key: CacheKey) -> Option<IDWriteFontFace5> {
+fn face_for(
+    cache: &mut Cache,
+    writer: &Writer,
+    fonts: &mut FontSystem,
+    key: CacheKey,
+) -> Option<(IDWriteFontFace5, Source)> {
     let italic = key.flags.contains(CacheKeyFlags::FAKE_ITALIC);
     let slot = (key.font_id, key.font_weight.0, key.font_optical, italic);
     if let Some(face) = cache.faces.get(&slot) {
@@ -151,9 +167,10 @@ fn face_for(cache: &mut Cache, writer: &Writer, fonts: &mut FontSystem, key: Cac
             made
         }
     };
-    let face = resource.and_then(|resource| {
+    let face = resource.and_then(|source| {
+        let resource = &source.resource;
         // SAFETY: the resource is owned here; the axis values outlive the call.
-        unsafe {
+        let face = unsafe {
             let count = resource.GetFontAxisCount() as usize;
             let mut axes = vec![DWRITE_FONT_AXIS_VALUE::default(); count];
             if count > 0 {
@@ -172,17 +189,20 @@ fn face_for(cache: &mut Cache, writer: &Writer, fonts: &mut FontSystem, key: Cac
                 DWRITE_FONT_SIMULATIONS_NONE
             };
             resource.CreateFontFace(simulations, &axes).ok()
-        }
+        };
+        face.map(|face| (face, source.clone()))
     });
     cache.faces.insert(slot, face.clone());
     face
 }
 
-/// Face `id`'s font resource, from its bytes (copied by DirectWrite).
-fn resource_for(writer: &Writer, fonts: &mut FontSystem, id: cosmic_text::fontdb::ID) -> Option<IDWriteFontResource> {
+/// Face `id`'s font resource, from its bytes (copied by DirectWrite), with
+/// its `gasp` ranges and whether it is hinted.
+fn resource_for(writer: &Writer, fonts: &mut FontSystem, id: cosmic_text::fontdb::ID) -> Option<Source> {
     let index = fonts.db().face(id)?.index;
     let font = fonts.get_font(id, cosmic_text::fontdb::Weight::NORMAL)?;
     let data = font.data();
+    let (gasp, hinted) = (gasp(&font), hinted(&font));
     // SAFETY: with no owner object, DirectWrite copies the bytes before
     // returning, so they need not outlive the call.
     unsafe {
@@ -195,13 +215,62 @@ fn resource_for(writer: &Writer, fonts: &mut FontSystem, id: cosmic_text::fontdb
                 None,
             )
             .ok()?;
-        writer.factory.CreateFontResource(&file, index).ok()
+        let resource = writer.factory.CreateFontResource(&file, index).ok()?;
+        Some(Source { resource, gasp, hinted })
+    }
+}
+
+/// `font`'s `gasp` ranges, version 1 or later.
+fn gasp(font: &cosmic_text::Font) -> Option<Vec<(u16, u16)>> {
+    let table = font.as_swash().table(u32::from_be_bytes(*b"gasp"))?;
+    let at = |i: usize| table.get(i..i + 2).map(|b| u16::from_be_bytes([b[0], b[1]]));
+    if at(0)? < 1 {
+        return None;
+    }
+    (0..usize::from(at(2)?))
+        .map(|i| Some((at(4 + 4 * i)?, at(6 + 4 * i)?)))
+        .collect()
+}
+
+/// Whether `font` has TrueType bytecode: `maxp`'s largest instructions.
+fn hinted(font: &cosmic_text::Font) -> bool {
+    font.as_swash()
+        .table(u32::from_be_bytes(*b"maxp"))
+        .filter(|table| table.len() >= 32 && table[0..4] == [0, 1, 0, 0])
+        .is_some_and(|table| u16::from_be_bytes([table[26], table[27]]) > 0)
+}
+
+/// Skia's rendering mode and em size for `source` at `ppem`
+/// (`SkScalerContext_DW`, as anomalyco/rune's `rendering_mode` reads it,
+/// MIT): a `gasp` table of version 1 says per size whether to smooth
+/// vertically; without one, hinted fonts at 20 px and under draw without it
+/// at the size GDI rounds to.
+fn chromium_mode(source: &Source, ppem: f32) -> (DWRITE_RENDERING_MODE1, f32) {
+    const SYMMETRIC_SMOOTHING: u16 = 0x0008;
+    let gdi = ((ppem * 64.).round() / 64.).max(1.);
+    if let Some(ranges) = &source.gasp
+        && let Some(&(_, flags)) = ranges.iter().find(|&&(max, _)| (gdi.round() as i32) <= i32::from(max))
+    {
+        let mode = if flags & SYMMETRIC_SMOOTHING != 0 {
+            DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC
+        } else {
+            DWRITE_RENDERING_MODE1_NATURAL
+        };
+        return (mode, ppem);
+    }
+    if ppem > 20. || !source.hinted {
+        (DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC, ppem)
+    } else {
+        (DWRITE_RENDERING_MODE1_NATURAL, gdi)
     }
 }
 
 /// `key`'s glyph of `face`, as a coverage mask placed from its pen position.
-fn draw(writer: &Writer, face: &IDWriteFontFace5, key: CacheKey) -> Option<SwashImage> {
+fn draw(writer: &Writer, face: &IDWriteFontFace5, source: &Source, key: CacheKey) -> Option<SwashImage> {
     let size = f32::from_bits(key.font_size_bits);
+    let chromium = crate::text_look() == crate::TextLook::Chromium;
+    let (chromium_mode, em) = chromium_mode(source, size);
+    let size = if chromium { em } else { size };
     let glyph = u16::try_from(key.glyph_id).ok()?;
     let advance = 0f32;
     let offset = DWRITE_GLYPH_OFFSET::default();
@@ -220,7 +289,7 @@ fn draw(writer: &Writer, face: &IDWriteFontFace5, key: CacheKey) -> Option<Swash
     // released below, the run holding it in a `ManuallyDrop`.
     let image = unsafe {
         let cleartype = params().is_some_and(|params| params.cleartype);
-        let antialias = if cleartype {
+        let antialias = if cleartype || chromium {
             DWRITE_TEXT_ANTIALIAS_MODE_CLEARTYPE
         } else {
             DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE
@@ -242,6 +311,11 @@ fn draw(writer: &Writer, face: &IDWriteFontFace5, key: CacheKey) -> Option<Swash
         if recommended.is_err() || mode == DWRITE_RENDERING_MODE1_OUTLINE || mode == DWRITE_RENDERING_MODE1_ALIASED {
             mode = DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC;
         }
+        // Chromium's: Skia's mode, grid fitting on (its hinting is
+        // "medium"), ClearType's coverage whatever the text then shows.
+        if chromium {
+            (mode, grid) = (chromium_mode, DWRITE_GRID_FIT_MODE_ENABLED);
+        }
         let analysis = writer.factory.CreateGlyphRunAnalysis(
             &run,
             None,
@@ -252,20 +326,24 @@ fn draw(writer: &Writer, face: &IDWriteFontFace5, key: CacheKey) -> Option<Swash
             key.x_bin.as_float(),
             key.y_bin.as_float(),
         );
-        analysis.ok().and_then(|analysis| mask(&analysis, cleartype))
+        analysis.ok().and_then(|analysis| mask(&analysis, cleartype || chromium, cleartype))
     };
     drop(std::mem::ManuallyDrop::into_inner(run.fontFace));
     image
 }
 
 /// The analysis' coverage, swash's way up: `top` above the baseline, rows
-/// from the top. Grayscale, one byte a pixel; or ClearType's (`cleartype`),
-/// four: red, green and blue coverage (in the screen's order) and their
-/// mean, which a renderer not blending them apart draws as grayscale.
+/// from the top. Grayscale, one byte a pixel; or ClearType's
+/// (`subpixels`), four: red, green and blue coverage (in the screen's
+/// order) and their mean, which a renderer not blending them apart draws as
+/// grayscale. A ClearType analysis (`three`) kept grayscale is its three
+/// coverages averaged, as Skia makes grayscale from ClearType
+/// (`kGenA8FromLCD_Flag`): DirectWrite's own grayscale has 17 levels.
 ///
 /// # Safety
 /// `analysis` is a live glyph run analysis.
-unsafe fn mask(analysis: &IDWriteGlyphRunAnalysis, cleartype: bool) -> Option<SwashImage> {
+unsafe fn mask(analysis: &IDWriteGlyphRunAnalysis, three: bool, subpixels: bool) -> Option<SwashImage> {
+    let cleartype = three;
     let kind = if cleartype {
         DWRITE_TEXTURE_CLEARTYPE_3x1
     } else {
@@ -288,7 +366,13 @@ unsafe fn mask(analysis: &IDWriteGlyphRunAnalysis, cleartype: bool) -> Option<Sw
             width,
             height,
         };
-        if cleartype {
+        if cleartype && !subpixels {
+            image.content = SwashContent::Mask;
+            image.data = data
+                .chunks_exact(3)
+                .map(|rgb| ((u16::from(rgb[0]) + u16::from(rgb[1]) + u16::from(rgb[2])) / 3) as u8)
+                .collect();
+        } else if cleartype {
             let bgr = params().is_some_and(|params| params.bgr);
             image.content = SwashContent::SubpixelMask;
             image.data = data

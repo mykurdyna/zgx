@@ -7,6 +7,6 @@ struct SubpixelOut { @location(0) @blend_src(0) color:vec4<f32>, @location(0) @b
 @fragment fn fs_subpixel(v:Basic)->SubpixelOut {
  if v.texture<0.5 {return SubpixelOut(vec4(v.color.rgb,1.),vec4(v.color.a));}
  let tex=textureSample(atlas,tex_sampler,v.uv);
- let c=dwrite3(tex.rgb,v.color.rgb)*v.color.a;
+ let c=coverage3(tex.rgb,v.color.rgb)*v.color.a;
  return SubpixelOut(vec4(v.color.rgb,1.),vec4(c,(c.r+c.g+c.b)/3.));
 }
