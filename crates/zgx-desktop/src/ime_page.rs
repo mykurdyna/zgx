@@ -30,7 +30,11 @@ pub fn set(node: NodeId, editing: bool, caret: Option<Rect>) {
                     page.caret = caret;
                 }
             }
-            None => pages.push(Page { node, editing, caret }),
+            None => pages.push(Page {
+                node,
+                editing,
+                caret,
+            }),
         }
     });
 }
@@ -42,7 +46,13 @@ pub fn remove(node: NodeId) {
 
 fn focused_page(ui: &Ui) -> Option<Page> {
     let focused = ui.input.focused()?;
-    PAGES.with(|pages| pages.borrow().iter().copied().find(|p| p.node == focused && p.editing))
+    PAGES.with(|pages| {
+        pages
+            .borrow()
+            .iter()
+            .copied()
+            .find(|p| p.node == focused && p.editing)
+    })
 }
 
 /// The focused page taking the input method, if any.
@@ -53,4 +63,41 @@ pub(crate) fn focused(ui: &Ui) -> Option<NodeId> {
 /// Where the focused page's caret shows, for the input method's candidates.
 pub(crate) fn area(ui: &Ui) -> Option<Rect> {
     focused_page(ui).and_then(|p| p.caret)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editable_page_context_follows_focus_and_removal() {
+        let mut ui = Ui::new(400., 200.);
+        let first = ui.button(ui.root(), "First", 100., || {});
+        let second = ui.button(ui.root(), "Second", 100., || {});
+        let shell = ui.button(ui.root(), "Shell", 100., || {});
+        let first_caret = Rect::new(15., 30., 1., 18.);
+        let second_caret = Rect::new(135., 30., 1., 18.);
+
+        set(first, true, Some(first_caret));
+        set(second, true, Some(second_caret));
+        for (focus, expected, caret) in [
+            (first, Some(first), Some(first_caret)),
+            (shell, None, None),
+            (second, Some(second), Some(second_caret)),
+            (first, Some(first), Some(first_caret)),
+        ] {
+            ui.input.focus(&ui.scene, Some(focus));
+            assert_eq!(focused(&ui), expected);
+            assert_eq!(area(&ui), caret);
+        }
+
+        set(first, false, None);
+        assert_eq!(focused(&ui), None);
+        assert_eq!(area(&ui), None);
+        ui.input.focus(&ui.scene, Some(second));
+        remove(second);
+        assert_eq!(focused(&ui), None);
+        assert_eq!(area(&ui), None);
+        remove(first);
+    }
 }

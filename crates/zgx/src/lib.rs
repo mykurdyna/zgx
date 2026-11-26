@@ -34,6 +34,8 @@ pub mod timer;
 
 pub mod env;
 pub mod frame;
+#[doc(hidden)]
+pub mod frame_hold;
 pub mod idle;
 pub mod profile;
 pub mod spare;
@@ -44,6 +46,7 @@ pub mod trace;
 pub mod caret_blink;
 pub mod clock;
 pub(crate) mod drag_scroll;
+pub(crate) mod editor_atom_clipboard;
 pub(crate) mod editor_atom_pointer;
 pub(crate) mod editor_atom_style;
 pub(crate) mod editor_autocorrect;
@@ -97,6 +100,8 @@ pub mod actions;
 
 mod action_context;
 
+#[doc(hidden)]
+pub mod callback_site;
 pub mod canvas;
 
 pub mod animation;

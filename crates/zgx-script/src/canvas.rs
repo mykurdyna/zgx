@@ -3,6 +3,7 @@
 //! canvas's size or the state it reads changes; equal drawings keep their
 //! pixels. Colours may name theme tokens (`"$accent"`): the drawing reads
 //! them as it reads state, so a theme change draws it again.
+use crate::Str;
 use crate::node::parse_color;
 use mlua::{Lua, Table, UserData, UserDataMethods};
 use std::{cell::RefCell, rc::Rc};
@@ -645,7 +646,75 @@ pub(crate) fn install(lua: &Lua, ui: &Table) -> mlua::Result<()> {
         )?,
     )?;
     ui.set("render_canvas", lua.create_function(render_canvas)?)?;
+    ui.set("measure_text", lua.create_function(measure_text)?)?;
     Ok(())
+}
+
+/// `ui.measure_text(text, style?)`: the `{ w, h }` points `text` takes in
+/// `style` (a canvas text's: `size`, `font`, `weight`, `italic`, `tabular`,
+/// `line_height`, `letter_spacing`), wrapped to lines at most `max_w`
+/// wide if given, as the app lays text out: nothing is mounted. A
+/// table's column fitted to its widest cell, a label's room. On the
+/// desktop in the app's fonts (as `ui.render_canvas` measures); in the
+/// browser as the page lays it out, once it has started (a view mounted).
+fn measure_text(lua: &Lua, (text, style): (String, Option<Table>)) -> mlua::Result<Table> {
+    let (size, font) = text_style(style.as_ref())?;
+    let size = match style
+        .as_ref()
+        .map(|s| s.get::<Option<f32>>("size"))
+        .transpose()?
+    {
+        Some(Some(_)) => size,
+        _ => MEASURE_SIZE,
+    };
+    let max_w = match style
+        .as_ref()
+        .map(|s| s.get::<Option<f32>>("max_w"))
+        .transpose()?
+    {
+        Some(Some(w)) if w.is_finite() && w > 0. => Some(w),
+        Some(Some(w)) => {
+            return Err(mlua::Error::runtime(format!(
+                "ui.measure_text: `max_w` is a number of points above 0, not {w}"
+            )));
+        }
+        _ => None,
+    };
+    let (w, h) = measured(lua, &text, size, max_w, &font)?;
+    let out = lua.create_table_with_capacity(0, 2)?;
+    out.raw_set("w", w)?;
+    out.raw_set("h", h)?;
+    Ok(out)
+}
+/// A text's size where `ui.measure_text` is given none: a `ui.text`'s.
+const MEASURE_SIZE: f32 = 14.;
+/// What `ui.measure_text` measures: in a scene with the app's fonts.
+#[cfg(not(target_arch = "wasm32"))]
+fn measured(
+    lua: &Lua,
+    text: &str,
+    size: f32,
+    max_w: Option<f32>,
+    font: &FontStyle,
+) -> mlua::Result<(f32, f32)> {
+    let env = crate::node::env(lua)?;
+    let fonts: Fonts = (env.platform.borrow().as_ref()).map_or_else(Vec::new, |p| p.0.fonts());
+    let scene = measuring(&fonts);
+    let scene = scene.borrow();
+    Ok(scene.measure_text_with_font(text, size, max_w, font))
+}
+/// What `ui.measure_text` measures: as the page lays it out.
+#[cfg(target_arch = "wasm32")]
+fn measured(
+    _: &Lua,
+    text: &str,
+    size: f32,
+    max_w: Option<f32>,
+    font: &FontStyle,
+) -> mlua::Result<(f32, f32)> {
+    zgx::canvas::measure_text_outside(text, size, max_w, font).ok_or_else(|| {
+        mlua::Error::runtime("ui.measure_text: the page measures once a view is mounted")
+    })
 }
 
 /// The fonts a render shapes with beside the system's: the app's windows'
@@ -938,9 +1007,9 @@ fn render_canvas(
             Some(Ok(Rendered::Written)) => Ok(crate::Value::Nil),
             Some(Ok(Rendered::Appended(bytes, width, height))) => Ok(crate::Value::Map(
                 vec![
-                    (Rc::from("bytes"), crate::Value::Num(bytes as f64)),
-                    (Rc::from("width"), crate::Value::Num(f64::from(width))),
-                    (Rc::from("height"), crate::Value::Num(f64::from(height))),
+                    (Str::from("bytes"), crate::Value::Num(bytes as f64)),
+                    (Str::from("width"), crate::Value::Num(f64::from(width))),
+                    (Str::from("height"), crate::Value::Num(f64::from(height))),
                 ]
                 .into(),
             )),

@@ -320,9 +320,41 @@ pub mod build {
     /// came from: `dir`'s own, and each package its `zgx.json` lists, under
     /// [`PACKAGES`]; the `.luaurc` aliases into a package name its copy.
     pub(crate) fn sources(dir: &Path) -> io::Result<Vec<(String, PathBuf, Vec<u8>)>> {
+        sources_skipping(dir, &[], true, Keep::Known, &mut Vec::new())
+    }
+
+    /// Which of a folder's files are taken.
+    #[derive(Clone, Copy)]
+    pub(crate) enum Keep<'a> {
+        /// Those of the kinds a host reads, hidden ones but `.luaurc` out.
+        Known,
+        /// Those, and the licences: what a bundle of them ships with.
+        #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+        KnownAndLicences,
+        /// Every one, hidden or not, but what isn't the app's: `.git`,
+        /// zgx's generated `.zgx` and macOS's `.DS_Store`. One that looks
+        /// like a secret, a folder too, is an error unless `allow` names it
+        /// (its path in the bundle, with `/`); so is a name there for
+        /// nothing in it.
+        #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+        Every { allow: &'a [String] },
+    }
+
+    /// As `sources`, leaving out the folders in `skip` (an app's native
+    /// modules' crates, whose `target/` holds files of the kinds kept),
+    /// and telling cargo what to watch only for a build script (`cargo`).
+    /// The files not taken are told in `left`, by their paths in the bundle
+    /// (a hidden folder as one).
+    pub(crate) fn sources_skipping(
+        dir: &Path,
+        skip: &[PathBuf],
+        cargo: bool,
+        keep: Keep<'_>,
+        left: &mut Vec<String>,
+    ) -> io::Result<Vec<(String, PathBuf, Vec<u8>)>> {
         let read = |rel: String, path: PathBuf| Ok((rel, std::fs::read(&path)?, path));
         let mut rels = Vec::new();
-        collect(dir, dir, &mut rels)?;
+        collect(dir, "", dir, skip, keep, &mut rels, left)?;
         let mut files = rels
             .into_iter()
             .map(|rel| {
@@ -330,20 +362,36 @@ pub mod build {
                 read(rel, path)
             })
             .collect::<io::Result<Vec<_>>>()?;
-        let packages = packages(dir)?;
+        let packages = packages(dir, cargo)?;
         for (name, folder) in &packages {
-            println!("cargo:rerun-if-changed={}", folder.display());
+            if cargo {
+                println!("cargo:rerun-if-changed={}", folder.display());
+            }
             let mut rels = Vec::new();
-            collect(folder, folder, &mut rels)?;
+            let at = format!("{PACKAGES}/{name}/");
+            collect(folder, &at, folder, skip, keep, &mut rels, left)?;
             for rel in rels {
                 let path = folder.join(&rel);
                 files.push(read(format!("{PACKAGES}/{name}/{rel}"), path)?);
             }
         }
+        if let Keep::Every { allow } = keep
+            && let Some(nothing) = allow.iter().find(|allowed| {
+                let inside = format!("{allowed}/");
+                !files
+                    .iter()
+                    .any(|(rel, ..)| rel == *allowed || rel.starts_with(&inside))
+            })
+        {
+            return Err(io::Error::other(format!(
+                "--allow {nothing}: no such file among those that ship"
+            )));
+        }
         if let Some(luaurc) = files.iter_mut().find(|(rel, ..)| rel == ".luaurc") {
             luaurc.1 = repoint(dir, &luaurc.1, &packages)?;
         }
         files.sort_by(|a, b| a.0.cmp(&b.0));
+        left.sort();
         Ok(files
             .into_iter()
             .map(|(rel, bytes, path)| (rel, path, bytes))
@@ -351,12 +399,14 @@ pub mod build {
     }
 
     /// The packages `dir`'s `zgx.json` lists, by name, as canonical folders.
-    fn packages(dir: &Path) -> io::Result<Vec<(String, PathBuf)>> {
+    fn packages(dir: &Path, cargo: bool) -> io::Result<Vec<(String, PathBuf)>> {
         let config = dir.join("zgx.json");
         let Ok(text) = std::fs::read_to_string(&config) else {
             return Ok(Vec::new());
         };
-        println!("cargo:rerun-if-changed={}", config.display());
+        if cargo {
+            println!("cargo:rerun-if-changed={}", config.display());
+        }
         let fail = |why: String| io::Error::other(format!("{}: {why}", config.display()));
         let json: serde_json::Value =
             serde_json::from_str(&text).map_err(|e| fail(e.to_string()))?;
@@ -412,35 +462,120 @@ pub mod build {
         serde_json::to_vec_pretty(&config).map_err(io::Error::other)
     }
 
-    fn collect(root: &Path, dir: &Path, out: &mut Vec<String>) -> io::Result<()> {
+    /// Whether a file called `name` looks like a key or a password, by its
+    /// name in any case: `.env*` (but `.env.example`), `.npmrc`, `.netrc`,
+    /// `*.pem`, `*.key`, `*.p12`, `*.pfx`, and SSH's own names for a key,
+    /// with an extension or without (`id_card.svg` isn't one).
+    fn secret(name: &str) -> bool {
+        let name = name.to_lowercase();
+        let (stem, extension) = name.split_once('.').unwrap_or((&name, ""));
+        let last = extension.rsplit('.').next().unwrap_or_default();
+        (name.starts_with(".env") && name != ".env.example")
+            || matches!(&*name, ".npmrc" | ".netrc")
+            || (!stem.is_empty() && matches!(last, "pem" | "key" | "p12" | "pfx"))
+            || matches!(stem, "id_rsa" | "id_ed25519" | "id_ecdsa" | "id_dsa")
+    }
+
+    /// Whether a file, or a folder of them, called `name` is licences by its
+    /// name, in any case: `LICENSE`, `NOTICE` and `COPYING`, alone or before
+    /// anything but more of a word (`LICENSE-MIT`, `licences/`, `NOTICE.txt`,
+    /// not `noticeboard`).
+    fn licence(name: &str) -> bool {
+        let name = name.to_lowercase();
+        ["license", "licence", "notice", "copying"]
+            .iter()
+            .filter_map(|word| name.strip_prefix(word))
+            .any(|rest| {
+                let rest = rest.strip_prefix('s').unwrap_or(rest);
+                !rest.starts_with(char::is_alphabetic)
+            })
+    }
+
+    /// The files of `root` in `dir`, by their paths in `root`, which is at
+    /// `at` in the bundle.
+    fn collect(
+        root: &Path,
+        at: &str,
+        dir: &Path,
+        skip: &[PathBuf],
+        keep: Keep<'_>,
+        out: &mut Vec<String>,
+        left: &mut Vec<String>,
+    ) -> io::Result<()> {
         for entry in std::fs::read_dir(dir)? {
             let path = entry?.path();
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            if name.starts_with('.') && name != ".luaurc" {
+            if skip.contains(&path) {
                 continue;
+            }
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let shipped = || {
+                let rel = path.strip_prefix(root).unwrap_or(&path);
+                format!("{at}{}", rel.to_string_lossy().replace('\\', "/"))
+            };
+            // Not the app's, whatever is kept.
+            if matches!(&*name, ".git" | ".zgx" | ".DS_Store") {
+                continue;
+            }
+            let every = matches!(keep, Keep::Every { .. });
+            if !every && name.starts_with('.') && name != ".luaurc" {
+                let folder = if path.is_dir() { "/" } else { "" };
+                left.push(format!("{}{folder}", shipped()));
+                continue;
+            }
+            // A key or a password left in the folder would go to everyone
+            // the app does.
+            if let Keep::Every { allow } = keep
+                && secret(&name)
+            {
+                let shipped = shipped();
+                if !allow.contains(&shipped) {
+                    return Err(io::Error::other(format!(
+                        "{}: looks like a secret, and every file of the folder ships: move it \
+                         out, or `--allow {shipped}` if it is meant to",
+                        path.display()
+                    )));
+                }
+            }
+            // Taken as it is, a link would be another folder's file, or a
+            // folder without end.
+            if every && path.is_symlink() && !(path.is_file() && crate::within(root, &path)) {
+                return Err(io::Error::other(format!(
+                    "{}: a link to a folder, or out of the app's (copy what it names)",
+                    path.display()
+                )));
             }
             if path.is_dir() {
-                collect(root, &path, out)?;
+                collect(root, at, &path, skip, keep, out, left)?;
                 continue;
             }
-            let wanted = matches!(
-                path.extension().and_then(|e| e.to_str()),
-                Some(
-                    "luau"
-                        | "json"
-                        | "png"
-                        | "jpg"
-                        | "jpeg"
-                        | "svg"
-                        | "gif"
-                        | "webp"
-                        | "glb"
-                        | "gltf"
-                        | "bin"
+            let wanted = every
+                || matches!(
+                    path.extension().and_then(|e| e.to_str()),
+                    Some(
+                        "luau"
+                            | "json"
+                            | "png"
+                            | "jpg"
+                            | "jpeg"
+                            | "svg"
+                            | "gif"
+                            | "webp"
+                            | "glb"
+                            | "gltf"
+                            | "bin"
+                    )
                 )
-            ) || name == ".luaurc";
-            if wanted && let Ok(rel) = path.strip_prefix(root) {
-                out.push(rel.to_string_lossy().replace('\\', "/"));
+                || name == ".luaurc";
+            let Ok(rel) = path.strip_prefix(root) else {
+                continue;
+            };
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            let wanted =
+                wanted || matches!(keep, Keep::KnownAndLicences) && rel.split('/').any(licence);
+            if wanted {
+                out.push(rel);
+            } else {
+                left.push(format!("{at}{rel}"));
             }
         }
         Ok(())

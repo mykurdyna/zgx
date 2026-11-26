@@ -3,6 +3,10 @@
 // Each file loads its own `common` (a Harness of its own, which files
 // add methods to), as it did as a binary of its own.
 #![allow(clippy::duplicate_mod)]
+#[path = "../atom_clipboard.rs"]
+mod atom_clipboard;
+#[path = "../atom_names.rs"]
+mod atom_names;
 #[path = "../atom_pointer.rs"]
 mod atom_pointer;
 #[path = "../atom_style.rs"]
@@ -28,6 +32,10 @@ mod drag_declined;
 mod driver;
 #[path = "../each_reorder.rs"]
 mod each_reorder;
+#[path = "../editor_fence_above.rs"]
+mod editor_fence_above;
+#[path = "../editor_group_leaves.rs"]
+mod editor_group_leaves;
 #[path = "../editor_metrics.rs"]
 mod editor_metrics;
 #[path = "../editor_props.rs"]
@@ -40,6 +48,8 @@ mod failures;
 mod file_drop;
 #[path = "../focus_snapshot.rs"]
 mod focus_snapshot;
+#[path = "../frames_measure.rs"]
+mod frames_measure;
 #[path = "../grid_areas.rs"]
 mod grid_areas;
 #[path = "../grid_tracks.rs"]
@@ -52,6 +62,8 @@ mod hit_target;
 mod host_surfaces;
 #[path = "../host_top_layer.rs"]
 mod host_top_layer;
+#[path = "../host_view.rs"]
+mod host_view;
 #[path = "../i18n_script.rs"]
 mod i18n_script;
 #[path = "../idle_gc.rs"]
@@ -100,8 +112,12 @@ mod list_tab_rows;
 mod list_thin_rows;
 #[path = "../markdown_lazy.rs"]
 mod markdown_lazy;
+#[path = "../measure_text.rs"]
+mod measure_text;
 #[path = "../mentions.rs"]
 mod mentions;
+#[path = "../modal_focus.rs"]
+mod modal_focus;
 #[path = "../pointer_lock.rs"]
 mod pointer_lock;
 #[path = "../pointer_through.rs"]
@@ -152,6 +168,8 @@ mod text_props;
 mod theme;
 #[path = "../ui.rs"]
 mod ui;
+#[path = "../ui_controls.rs"]
+mod ui_controls;
 #[path = "../ui_map.rs"]
 mod ui_map;
 #[path = "../variants.rs"]

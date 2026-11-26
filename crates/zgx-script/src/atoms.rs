@@ -3,6 +3,7 @@
 //! carrying a plain value. The editor keeps them (`zgx::text_edit::Atom`);
 //! what a script adds rides in the atom's payload, so it moves with the atom
 //! through edits and comes back with it on undo.
+use crate::Field;
 use crate::value::Value;
 use std::sync::{Arc, atomic::AtomicU64, atomic::Ordering};
 use zgx::{
@@ -48,7 +49,7 @@ pub(crate) fn value_json(value: &Value) -> Option<String> {
             }
             Value::Map(fields) => {
                 out.push('{');
-                for (i, (key, item)) in fields.iter().enumerate() {
+                for (i, Field(key, item)) in fields.iter().enumerate() {
                     if i > 0 {
                         out.push(',');
                     }
@@ -152,6 +153,9 @@ pub(crate) fn item(atom: &Atom, chars: (usize, usize)) -> Value {
         }
         None => fields.push(("id", Value::Str(format!("atom-{}", atom.id).into()))),
     }
+    if let Some(name) = &atom.name {
+        fields.push(("name", Value::Str(name.as_ref().into())));
+    }
     Value::record(fields)
 }
 
@@ -159,8 +163,8 @@ pub(crate) fn item(atom: &Atom, chars: (usize, usize)) -> Value {
 pub(crate) fn with_label(item: Value, label: &str) -> Value {
     match item {
         Value::Map(fields) => {
-            let mut all: Vec<(std::rc::Rc<str>, Value)> = fields.to_vec();
-            all.push((std::rc::Rc::from("label"), Value::Str(label.into())));
+            let mut all: Vec<crate::Field> = fields.to_vec();
+            all.push(crate::Field("label".into(), Value::Str(label.into())));
             Value::record(all)
         }
         other => other,
@@ -218,10 +222,16 @@ pub(crate) fn from_list(
             .and_then(|style| Some((style, look_of(style)?)));
         let style_json = look.as_ref().and_then(|(style, _)| value_json(style));
         let json = value_json(&data);
+        // What a reader reads for it instead of its text.
+        let name: Option<Arc<str>> = match item.field("name") {
+            Some(Value::Str(name)) if !name.is_empty() => Some(Arc::from(&**name)),
+            _ => None,
+        };
         let same = current.iter().find(|atom| {
-            script_atom(atom).is_some_and(|s| {
-                s.key == key && s.data == json && s.bg == bg && s.style == style_json
-            })
+            atom.name == name
+                && script_atom(atom).is_some_and(|s| {
+                    s.key == key && s.data == json && s.bg == bg && s.style == style_json
+                })
         });
         let atom = match same {
             Some(old) => Atom {
@@ -239,10 +249,101 @@ pub(crate) fn from_list(
                     wash: bg.as_deref().and_then(color_of),
                     payload: Some(styled_payload(key, &data, bg, style_json)),
                     style: look.map(|(_, style)| style),
+                    name,
                 }
             }
         };
         out.push(atom);
     }
     out
+}
+
+/// What goes on the clipboard of `atom` beyond the app (`AtomCodec::encode`):
+/// `{ id, data?, style? }` as JSON, as a script gave them.
+pub(crate) fn clipboard_json(atom: &Atom) -> Option<String> {
+    let script = script_atom(atom)?;
+    let mut out = String::from("{\"id\":");
+    out.push_str(&serde_json::to_string(&script.key).ok()?);
+    if let Some(name) = &atom.name {
+        out.push_str(",\"name\":");
+        out.push_str(&serde_json::to_string(&**name).ok()?);
+    }
+    if let Some(data) = &script.data {
+        out.push_str(",\"data\":");
+        out.push_str(data);
+    }
+    if let Some(style) = &script.style {
+        out.push_str(",\"style\":");
+        out.push_str(style);
+    } else if let Some(bg) = &script.bg {
+        out.push_str(",\"style\":{\"bg\":");
+        out.push_str(&serde_json::to_string(bg).ok()?);
+        out.push('}');
+    }
+    out.push('}');
+    Some(out)
+}
+
+/// The text and atoms the clipboard's atoms type holds (`AtomCodec::decode`),
+/// each atom made as a script's (its name kept unless `existing` has it),
+/// its range in characters of the text.
+pub(crate) fn from_clipboard(
+    json: &str,
+    existing: &[Atom],
+    color_of: &dyn Fn(&str) -> Option<Color>,
+    look_of: &dyn Fn(&Value) -> Option<Arc<zgx::widgets::AtomStyle>>,
+) -> Option<(String, zgx::widgets::PlacedAtoms)> {
+    let value = crate::json::parse(json).ok()?;
+    if !matches!(value.field("v"), Some(Value::Num(v)) if *v == 1.) {
+        return None;
+    }
+    let Some(Value::Str(text)) = value.field("text") else {
+        return None;
+    };
+    let Some(Value::List(items)) = value.field("atoms") else {
+        return None;
+    };
+    let mut taken: Vec<String> = existing
+        .iter()
+        .filter_map(|atom| script_atom(atom).map(|s| s.key.clone()))
+        .collect();
+    let mut out = Vec::with_capacity(items.len());
+    for item in items.iter() {
+        let number = |key: &str| match item.field(key) {
+            Some(Value::Num(n)) if n.is_finite() && *n >= 0. => Some(*n as usize),
+            _ => None,
+        };
+        let (Some(from), Some(to)) = (number("from"), number("to")) else {
+            continue;
+        };
+        let own = item.field("atom").cloned().unwrap_or(Value::Nil);
+        let key = match own.field("id") {
+            Some(Value::Str(id)) if !taken.iter().any(|t| **t == **id) => id.to_string(),
+            _ => fresh_key(),
+        };
+        taken.push(key.clone());
+        let data = own.field("data").cloned().unwrap_or(Value::Nil);
+        let style = own.field("style");
+        let bg = match style.and_then(|style| style.field("bg")) {
+            Some(Value::Str(bg)) => Some(bg.to_string()),
+            _ => None,
+        };
+        let look = style.and_then(|style| Some((style, look_of(style)?)));
+        let style_json = look.as_ref().and_then(|(style, _)| value_json(style));
+        out.push((
+            from..to,
+            Atom {
+                id: 0,
+                range: 0..0,
+                wash: bg.as_deref().and_then(color_of),
+                payload: Some(styled_payload(key, &data, bg, style_json)),
+                style: look.map(|(_, style)| style),
+                name: match own.field("name") {
+                    Some(Value::Str(name)) if !name.is_empty() => Some(Arc::from(&**name)),
+                    _ => None,
+                },
+            },
+        ));
+    }
+    Some((text.to_string(), out))
 }

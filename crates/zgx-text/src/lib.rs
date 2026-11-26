@@ -11,7 +11,9 @@ use zgx::scene::Scene;
 mod core_text_fallback;
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
-pub use core_text_fallback::{core_text_advance, install_core_text_fallback};
+pub use core_text_fallback::{
+    core_text_advance, install_chrome_core_text_fallback, install_core_text_fallback,
+};
 #[cfg(target_os = "macos")]
 mod core_text_glyphs;
 #[cfg(windows)]
@@ -25,6 +27,13 @@ pub mod text;
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
 pub use core_text_glyphs::core_text_glyph;
+/// The fonts Core Text drew glyphs with, let go for an app at rest: Core
+/// Text keeps their glyphs while they live. Drawn again, they are made again.
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub fn rest_core_text_glyphs() {
+    core_text_glyphs::rest();
+}
 pub use font_cache::set_desktop_sans_serif;
 pub use look::{TextLook, set_text_look, text_look};
 

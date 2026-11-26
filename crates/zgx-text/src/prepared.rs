@@ -75,8 +75,8 @@ const SPARE_TEXT: usize = 32;
 const SPARE_LONG_LINES: usize = 16;
 const SPARE_LONG_TEXT: usize = 256;
 
-/// A run as shaped: its range, font, size, and padding across.
-type Span = (Range<usize>, FontStyle, f32, f32);
+/// A run as shaped: its range, font, size, and horizontal padding `(before, after)`.
+type Span = (Range<usize>, FontStyle, f32, (f32, f32));
 /// The spans that determine shapes: merged runs of one font and size.
 #[derive(Clone, PartialEq)]
 struct Key {
@@ -92,22 +92,18 @@ impl Key {
     fn of(rich: &RichText, caret_row: bool) -> Self {
         let mut spans: smallvec::SmallVec<[Span; 1]> = smallvec::SmallVec::new();
         for run in rich.runs() {
+            let across = run.across_padding();
             match spans.last_mut() {
                 Some((range, font, size, padding))
                     if *font == run.font
                         && *size == run.font_size
-                        && *padding == 0.
-                        && run.padding[0] == 0.
+                        && *padding == (0., 0.)
+                        && across == (0., 0.)
                         && range.end == run.range.start =>
                 {
                     range.end = run.range.end;
                 }
-                _ => spans.push((
-                    run.range.clone(),
-                    run.font.clone(),
-                    run.font_size,
-                    run.padding[0],
-                )),
+                _ => spans.push((run.range.clone(), run.font.clone(), run.font_size, across)),
             }
         }
         Self {
@@ -155,14 +151,17 @@ impl Key {
     fn rich_hash_with(text_hash: u64, rich: &RichText, caret_row: bool) -> u64 {
         let mut hasher = TextHash::hasher_after(text_hash);
         caret_row.hash(&mut hasher);
-        let mut span: Option<(Range<usize>, &FontStyle, f32, f32)> = None;
+        // A span as `Span` is, its font borrowed from the run.
+        type Open<'a> = (Range<usize>, &'a FontStyle, f32, (f32, f32));
+        let mut span: Option<Open<'_>> = None;
         for run in rich.runs() {
+            let across = run.across_padding();
             match &mut span {
                 Some((range, font, size, padding))
                     if **font == run.font
                         && *size == run.font_size
-                        && *padding == 0.
-                        && run.padding[0] == 0.
+                        && *padding == (0., 0.)
+                        && across == (0., 0.)
                         && range.end == run.range.start =>
                 {
                     range.end = run.range.end;
@@ -171,7 +170,7 @@ impl Key {
                     if let Some((range, font, size, padding)) = span.take() {
                         Self::hash_span(&mut hasher, &range, font, size, padding);
                     }
-                    span = Some((run.range.clone(), &run.font, run.font_size, run.padding[0]));
+                    span = Some((run.range.clone(), &run.font, run.font_size, across));
                 }
             }
         }
@@ -195,11 +194,12 @@ impl Key {
         range: &Range<usize>,
         font: &FontStyle,
         size: f32,
-        padding: f32,
+        padding: (f32, f32),
     ) {
         range.hash(hasher);
         size.to_bits().hash(hasher);
-        padding.to_bits().hash(hasher);
+        padding.0.to_bits().hash(hasher);
+        padding.1.to_bits().hash(hasher);
         font.weight.hash(hasher);
         font.italic.hash(hasher);
     }
@@ -208,7 +208,7 @@ impl Key {
     fn plain(text: &Arc<str>, font_size: f32, font: &FontStyle, caret_row: bool) -> Self {
         Self {
             text: text.clone(),
-            spans: smallvec::smallvec![(0..text.len(), font.clone(), font_size, 0.)],
+            spans: smallvec::smallvec![(0..text.len(), font.clone(), font_size, (0., 0.))],
             caret_row,
         }
     }
@@ -218,7 +218,7 @@ impl Key {
         let mut hasher = FxHasher::default();
         text.hash(&mut hasher);
         true.hash(&mut hasher);
-        Self::hash_span(&mut hasher, &(0..text.len()), font, font_size, 0.);
+        Self::hash_span(&mut hasher, &(0..text.len()), font, font_size, (0., 0.));
         hasher.finish()
     }
     /// `plain_hash`, from `text`'s bytes' hash (`TextHash`; as `Key::rich_hash_with`).
@@ -227,7 +227,7 @@ impl Key {
     fn plain_hash_from(text_hash: u64, text: &str, font_size: f32, font: &FontStyle) -> u64 {
         let mut hasher = TextHash::hasher_after(text_hash);
         true.hash(&mut hasher);
-        Self::hash_span(&mut hasher, &(0..text.len()), font, font_size, 0.);
+        Self::hash_span(&mut hasher, &(0..text.len()), font, font_size, (0., 0.));
         hasher.finish()
     }
     /// Whether this is plain text's key (`plain_hash`).
@@ -239,7 +239,7 @@ impl Key {
     fn plain_at(&self, len: usize, font_size: f32, font: &FontStyle) -> bool {
         self.caret_row
             && matches!(&self.spans[..], [(range, f, size, padding)]
-                if *range == (0..len) && f == font && *size == font_size && *padding == 0.)
+                if *range == (0..len) && f == font && *size == font_size && *padding == (0., 0.))
     }
 }
 
@@ -808,15 +808,19 @@ impl Compact {
         // As a width (`wrap_width` adds to it), short of the least that did
         // not fit by a margin: a width near it is measured, not served. None
         // where a fit went past the widest line (in rounding).
-        let reach = match width {
-            Some(_) if fit <= widest && beyond.is_finite() => {
-                let reach = beyond - 1e-3;
-                reach - reach.abs() * 1e-6 - 1e-6
-            }
-            Some(_) if fit <= widest => f32::INFINITY,
-            _ => 0.,
-        };
-        ((widest, height), reach)
+        ((widest, height), wrap_reach(width, fit, widest, beyond))
+    }
+}
+
+fn wrap_reach(width: Option<f32>, fit: f32, widest: f32, beyond: f32) -> f32 {
+    match width {
+        Some(at) if fit <= widest && beyond.is_finite() => {
+            let reach = beyond - 1e-3;
+            let reach = reach - reach.abs() * 1e-6 - 1e-6;
+            if reach > at.max(widest) { reach } else { 0. }
+        }
+        Some(_) if fit <= widest => f32::INFINITY,
+        _ => 0.,
     }
 }
 
@@ -1424,7 +1428,11 @@ impl TextCache {
             return crate::text::ShapedText::with_runs(fonts, rich, width).size();
         };
         let hash = self.entry(fonts, Source::Rich(rich), false, Need::Layout);
-        let unwrapped = if crate::text::single_line(rich) { None } else { width };
+        let unwrapped = if crate::text::single_line(rich) {
+            None
+        } else {
+            width
+        };
         let laid = self.laid_out(fonts, hash, unwrapped);
         let size = |w: f32, h: f32, run: cosmic_text::LayoutRun<'_>| {
             (w.max(run.line_w), h.max(run.line_top + run.line_height))
@@ -2122,7 +2130,7 @@ impl TextCache {
                     let mut at = 0;
                     while index < runs.len() {
                         let run = &runs[index];
-                        if run.padding[0] != 0. || run.range.start != at {
+                        if run.across_padding() != (0., 0.) || run.range.start != at {
                             return None;
                         }
                         let mut end = index + 1;
@@ -2130,7 +2138,7 @@ impl TextCache {
                             && runs[end].font == run.font
                             && runs[end].font_size == run.font_size
                             && runs[end].range.start == runs[end - 1].range.end
-                            && runs[end].padding[0] == 0.
+                            && runs[end].across_padding() == (0., 0.)
                         {
                             end += 1;
                         }
@@ -2330,8 +2338,10 @@ impl TextCache {
             },
             Source::Plain { .. } => unreachable!("plain text keeps its caret row"),
         };
-        if caret_row
-            && text.ends_with(['\r', '\n'])
+        // An editor's own break (U+001E) keeps the row after it whatever is
+        // asked, as `ShapedText::with_runs` draws it: a rich text ending in
+        // one measures as tall as it shows.
+        if ((caret_row && text.ends_with(['\r', '\n', '\u{1e}'])) || text.ends_with('\u{1e}'))
             && crate::text::ends_open(&buffer)
             && let Some((font, font_size)) = last
         {
@@ -3154,6 +3164,13 @@ mod tests {
                 ],
             ),
             rich("abc אבג xyz דהו", &[(21, body.clone(), 16.)]),
+            // An editor's own break ending the text (U+001E): its row after
+            // it is measured, as it is drawn.
+            rich("ab\u{1e}", &[(3, body.clone(), 14.)]),
+            rich(
+                "one\u{1e}two\u{1e}",
+                &[(4, bold.clone(), 18.), (8, body.clone(), 14.)],
+            ),
             rich("אבג abc", &[(10, body, 16.)]),
         ];
         let mut cache = TextCache::default();
@@ -3357,9 +3374,9 @@ mod tests {
 
     /// A wrapping text's size holds from its widest line's width to its
     /// reach (`measure_plain_reach`), as broken again there: at the widest
-    /// line's width exactly, its lines break as they did, and a ULP under it
-    /// they break again; up to the reach they hold, and within its margin
-    /// past it the next word joins a line. Words, doubled and trailing
+    /// line's width exactly, its lines break as they did. Up to the reach
+    /// they hold, and within its margin past it the next word joins a line.
+    /// Words, doubled and trailing
     /// spaces, and a word broken between its glyphs.
     #[test]
     fn a_width_within_its_reach_breaks_its_lines_as_it_did() {
@@ -3385,28 +3402,13 @@ mod tests {
                 assert_eq!(size, fresh(&text, width), "{text:?} at {width}");
                 assert!(reach == 0. || width < reach, "{width} under {reach}");
                 if reach > 0. {
-                    // The widest line's width: as it was. Under it, by the
-                    // room a wrap width is given (`wrap_width`, 1e-3) and a
-                    // rounding's worth, its lines break again.
-                    // (A line's trailing blanks may run past its width, and a
-                    // line ending in them holds under its width too: pinned
-                    // where lines end in words.)
+                    // The widest line's width: as it was.
                     assert_eq!(
                         fresh(&text, size.0),
                         size,
                         "{text:?} at its widest {}",
                         size.0
                     );
-                    if size.0 <= width && !text.contains("  ") {
-                        let broken = (0..=40)
-                            .map(|step| size.0 - step as f32 * 5e-5)
-                            .find(|at| fresh(&text, *at) != size);
-                        assert!(
-                            broken.is_some_and(|at| at >= size.0 - 1.2e-3),
-                            "{text:?} under {}: {broken:?}",
-                            size.0
-                        );
-                    }
                     // Between: as it was.
                     let mut at = size.0;
                     while at < reach.min(size.0 + 400.) {

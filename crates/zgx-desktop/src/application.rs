@@ -190,9 +190,128 @@ impl Default for WindowOptions {
         }
     }
 }
+/// Some window has an `on_close_requested`: a quit waits for it.
+#[cfg(all(target_os = "macos", zgx_winit_patched))]
+static CLOSE_HANDLERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether AppKit may quit the app now. A session that ends (a logout, a
+/// restart, a shutdown) is never refused, which would cancel it for the
+/// whole system: nothing is asked, and each window's `on_closed` runs
+/// before the answer (`close_all`), as nothing of ours need run after it.
+/// Any other quit waits for the windows' `on_close_requested`, if one is set
+/// (`ask`).
+#[cfg(any(test, all(target_os = "macos", zgx_winit_patched)))]
+fn may_quit(
+    reason: Option<[u8; 4]>,
+    close_handlers: bool,
+    close_all: impl FnOnce(),
+    ask: impl FnOnce(),
+) -> Quit {
+    if reason.is_some_and(ends_session) {
+        close_all();
+        return Quit::EndSession;
+    }
+    if close_handlers {
+        ask();
+        return Quit::Cancel;
+    }
+    Quit::Now
+}
+/// `may_quit`'s answer (`winit::platform::macos::Terminate`).
+#[cfg(any(test, all(target_os = "macos", zgx_winit_patched)))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Quit {
+    Cancel,
+    Now,
+    EndSession,
+}
+/// The order a quit asks windows in, given each with whether it is the key
+/// window: that one, then the rest as they opened.
+fn ask_order(windows: impl Iterator<Item = (u64, bool)>) -> Vec<u64> {
+    let mut windows: Vec<_> = windows.collect();
+    windows.sort_by_key(|(token, key)| (!key, *token));
+    windows.into_iter().map(|(token, _)| token).collect()
+}
+/// Whether a quit for `reason` (`kAEQuitReason`) ends the session. Apple's
+/// AERegistry.h documents four reasons: `rlgo` (kAEReallyLogOut), `rest`
+/// (kAERestart), `shut` (kAEShutDown), and `quia` (kAEQuitAll), which quits
+/// the apps and goes on. The others ask for the dialogs (kAELogOut,
+/// kAEShowRestartDialog, kAEShowShutdownDialog) and aren't documented as
+/// reasons; one given as a reason could only mean the same.
+#[cfg(any(test, all(target_os = "macos", zgx_winit_patched)))]
+fn ends_session(reason: [u8; 4]) -> bool {
+    matches!(
+        &reason,
+        b"rlgo" | b"rest" | b"shut" | b"logo" | b"rrst" | b"rsdn"
+    )
+}
+/// Why the quit `event` was sent (`kAEQuitReason`), if it says: a parameter
+/// by AERegistry.h, an attribute as AppKit's callers read it.
+#[cfg(target_os = "macos")]
+#[cfg_attr(not(zgx_winit_patched), allow(dead_code))]
+fn quit_reason(event: &objc2_foundation::NSAppleEventDescriptor) -> Option<[u8; 4]> {
+    let key = u32::from_be_bytes(*b"why?");
+    event
+        .attributeDescriptorForKeyword(key)
+        .or_else(|| event.paramDescriptorForKeyword(key))
+        .map(|reason| reason.typeCodeValue().to_be_bytes())
+}
+#[cfg(all(target_os = "macos", zgx_winit_patched))]
+fn current_quit_reason() -> Option<[u8; 4]> {
+    let event =
+        objc2_foundation::NSAppleEventManager::sharedAppleEventManager().currentAppleEvent()?;
+    quit_reason(&event)
+}
+/// A window's `on_closed` handlers, each run once, whichever comes first:
+/// the window's closing, the app's exit, or a session's end.
+#[derive(Default)]
+struct ClosedHandlers(RefCell<std::collections::VecDeque<Box<dyn FnOnce()>>>);
+impl ClosedHandlers {
+    /// Run those not run yet, in the order given. One that panics stops
+    /// none after it; its panic goes on once they ran.
+    fn run(&self) {
+        let mut panic = None;
+        loop {
+            let Some(handler) = self.0.borrow_mut().pop_front() else {
+                break;
+            };
+            if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(handler)) {
+                panic.get_or_insert(payload);
+            }
+        }
+        if let Some(payload) = panic {
+            std::panic::resume_unwind(payload);
+        }
+    }
+}
+#[cfg(any(test, all(target_os = "macos", zgx_winit_patched)))]
+thread_local! {
+    /// Each window's `on_closed`, in the order they opened, for a session's
+    /// end: AppKit asks outside the event loop's turns, where the window
+    /// manager isn't at hand.
+    static CLOSED_HANDLERS: RefCell<Vec<std::rc::Weak<ClosedHandlers>>> =
+        const { RefCell::new(Vec::new()) };
+}
+/// Run every open window's `on_closed`, one window's panic stopping no other's.
+#[cfg(any(test, all(target_os = "macos", zgx_winit_patched)))]
+fn run_all_closed() {
+    let windows = CLOSED_HANDLERS.with(|all| {
+        all.borrow()
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .collect::<Vec<_>>()
+    });
+    for window in windows {
+        // (The panic hook has logged it.)
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| window.run()));
+    }
+}
 #[derive(Debug)]
 enum Event {
     Quit,
+    /// ⌘Q or the app menu's Quit (macOS): every window's `on_close_requested`
+    /// is asked before the app exits.
+    #[cfg_attr(not(all(target_os = "macos", zgx_winit_patched)), allow(dead_code))]
+    QuitRequested,
     /// An event, with the token of the launch that sent it (Linux).
     Application(crate::ApplicationEvent, Option<String>),
     MenuAction(u64, crate::MenuAction),
@@ -848,7 +967,7 @@ pub struct WindowContext {
     #[allow(dead_code)]
     native_diagnostics: crate::native_host::NativeDiagnosticsHandle,
     close_requested: Option<Box<dyn FnMut() -> bool>>,
-    closed: Option<Box<dyn FnOnce()>>,
+    closed: Rc<ClosedHandlers>,
     menu_action: Option<Box<dyn FnMut(crate::MenuAction)>>,
 }
 impl WindowContext {
@@ -967,25 +1086,45 @@ impl WindowContext {
     }
 
     /// Return false to keep the window open, for example while asking about unsaved data.
+    ///
+    /// The app menu's Quit (⌘Q, macOS) asks every window's handler too, the
+    /// key window's first and then the rest as they opened, and quits only if
+    /// all agree: the first refusal stops the asking. `WindowFactory::quit`
+    /// asks none.
     pub fn on_close_requested(&mut self, handler: impl FnMut() -> bool + 'static) {
+        #[cfg(all(target_os = "macos", zgx_winit_patched))]
+        CLOSE_HANDLERS.store(true, std::sync::atomic::Ordering::Relaxed);
         self.close_requested = Some(Box::new(handler));
     }
     /// Called once before UI state is disposed. Pending tasks are cancelled
     /// on closure. Each handler given runs, in the order given: a second
     /// doesn't replace the first.
+    ///
+    /// A session's end on macOS (a logout, a restart, a shutdown) closes the
+    /// windows without asking `on_close_requested`: save here, before
+    /// returning, as nothing need run after. Every window's handlers run one
+    /// after another on the main thread. How long they have is no promise:
+    /// Apple's archived Daemons and Services Programming Guide ("Terminating
+    /// Processes") says a foreground app that hasn't quit in 45 seconds makes
+    /// the system cancel the logout (it isn't killed), of apps that aren't
+    /// Cocoa's; for Cocoa it documents only two minutes after
+    /// `NSTerminateLater`, which zgx doesn't answer. zgx sets no limit of its
+    /// own, so a longer save still finishes. One that runs the run loop (a
+    /// native modal dialog) when the session ends is cut off where it is.
     pub fn on_closed(&mut self, handler: impl FnOnce() + 'static) {
-        self.closed = Some(then(self.closed.take(), handler));
+        self.closed.0.borrow_mut().push_back(Box::new(handler));
     }
 }
-/// `first`, if there is one, then `next`.
-fn then(first: Option<Box<dyn FnOnce()>>, next: impl FnOnce() + 'static) -> Box<dyn FnOnce()> {
-    match first {
-        Some(first) => Box::new(move || {
-            first();
-            next();
-        }),
-        None => Box::new(next),
-    }
+/// A new window's `on_closed` handlers, found at a session's end.
+fn closed_handlers() -> Rc<ClosedHandlers> {
+    let handlers = Rc::new(ClosedHandlers::default());
+    #[cfg(any(test, all(target_os = "macos", zgx_winit_patched)))]
+    CLOSED_HANDLERS.with(|all| {
+        let mut all = all.borrow_mut();
+        all.retain(|window| window.strong_count() > 0);
+        all.push(Rc::downgrade(&handlers));
+    });
+    handlers
 }
 /// A desktop application: its fonts, first window, menus and native
 /// events. [`Application::run`] starts the event loop.
@@ -1123,6 +1262,8 @@ impl Application {
         if zgx::env::var_os("ZGX_FREEZE_TIME").is_some_and(|v| !v.is_empty() && v != "0") {
             zgx::clock::freeze();
         }
+        // A contained panic's banner names where it was.
+        note_panic_sites();
         // Who the app is to the system's notifications and badge.
         crate::notify::set_identity(crate::notify::Identity {
             application_id: self.application_id.clone(),
@@ -1172,6 +1313,25 @@ impl Application {
         zgx::profile::mark("event loop");
         zgx::memory::set_hosted();
         let proxy = event_loop.create_proxy();
+        #[cfg(all(target_os = "macos", zgx_winit_patched))]
+        {
+            let quit = proxy.clone();
+            winit::platform::macos::set_terminate_gate(Some(Rc::new(move || {
+                let answer = may_quit(
+                    current_quit_reason(),
+                    CLOSE_HANDLERS.load(std::sync::atomic::Ordering::Relaxed),
+                    run_all_closed,
+                    || {
+                        let _ = quit.send_event(Event::QuitRequested);
+                    },
+                );
+                match answer {
+                    Quit::Cancel => winit::platform::macos::Terminate::Cancel,
+                    Quit::Now => winit::platform::macos::Terminate::Quit,
+                    Quit::EndSession => winit::platform::macos::Terminate::EndSession,
+                }
+            })));
+        }
         let native_events = if let Some(id) = &self.application_id {
             let wake = proxy.clone();
             let events = crate::native_events::NativeApplicationEvents::new(
@@ -1935,6 +2095,9 @@ struct Host {
     /// A GPU renderer couldn't be made for content only it draws: the
     /// raster draws on without it, and none is tried again.
     gpu_refused: bool,
+    /// Its GPU renderer took over from the raster (`raster_to_gpu`): what
+    /// the first present's line says of the path it drew by.
+    from_raster: bool,
     /// When to try making a renderer again after the GPU device was lost
     /// (`recover_renderer`), while none could be made.
     renderer_retry: Option<std::time::Instant>,
@@ -2000,6 +2163,9 @@ struct Host {
     /// When to draw again a plane's frame left for a tick (its last drawable
     /// not yet shown: `GpuRenderer::planes_owed`), though nothing else asks.
     plane_retry: Option<std::time::Instant>,
+    /// Until when the script holds the window's frame (`Ui::hold_frames`):
+    /// no frame is drawn before then unless it lets go.
+    frames_held: Option<std::time::Instant>,
     /// Until when input keeps frames at the display's full rate (`INPUT_FULL_RATE`).
     #[cfg(any(target_os = "macos", windows))]
     input_until: Option<std::time::Instant>,
@@ -2115,6 +2281,8 @@ struct Host {
     startup_trim: StartupTrim,
     /// Timer tick (no native source) or watchdog deadline (native source).
     frame_deadline: Option<std::time::Instant>,
+    /// `frame_deadline` is the native source's watchdog (`arm_watchdog`).
+    frame_watchdog: bool,
     /// When frames started being wanted, or the last native tick since.
     frame_heartbeat: Option<std::time::Instant>,
     /// A Wayland redraw is pending on the compositor's frame callback.
@@ -2131,6 +2299,9 @@ struct Host {
     popup_revisions: u64,
     /// Geometry alone reaches assistive technology at most every 100 ms.
     accessibility_pacer: crate::accessibility::GeometryPacer,
+    /// What a client was sent, for a test standing in for one.
+    #[cfg(test)]
+    accessibility_read: Option<Vec<accesskit::TreeUpdate>>,
     /// The display text selection last published as the primary selection.
     #[cfg(target_os = "linux")]
     primary_revision: u64,
@@ -2405,7 +2576,7 @@ impl Host {
             viewport,
             frames: frames.clone(),
             close_requested: None,
-            closed: None,
+            closed: closed_handlers(),
             tasks: TaskSpawner {
                 pending: pending.clone(),
                 proxy: proxy.clone(),
@@ -2430,6 +2601,7 @@ impl Host {
             renderer: None,
             raster: None,
             gpu_refused: false,
+            from_raster: false,
             renderer_retry: None,
             error_banner: None,
             render_fault: None,
@@ -2499,6 +2671,7 @@ impl Host {
             #[cfg(target_os = "macos")]
             planes_drawn_at: None,
             plane_retry: None,
+            frames_held: None,
             #[cfg(any(target_os = "macos", windows))]
             input_until: None,
             #[cfg(any(target_os = "macos", windows))]
@@ -2560,6 +2733,7 @@ impl Host {
             #[cfg(target_os = "macos")]
             frame_starts: std::collections::VecDeque::new(),
             frame_deadline: None,
+            frame_watchdog: false,
             frame_heartbeat: None,
             frame_redraw_requested: false,
             focus_memory: crate::focus_memory::FocusMemory::default(),
@@ -2568,6 +2742,8 @@ impl Host {
             accessibility_revealed: false,
             popup_revisions: 0,
             accessibility_pacer: Default::default(),
+            #[cfg(test)]
+            accessibility_read: None,
             #[cfg(target_os = "linux")]
             primary_revision: 0,
             native_cursor: None,
@@ -2781,22 +2957,23 @@ impl Host {
         }
         if let (Some(adapter), Some(_)) = (&mut self.adapter, &self.window) {
             let ui = &self.context.ui;
-            adapter.update_if_active(|| {
+            let (tree, scale) = (&mut self.tree, self.scale_factor);
+            let title = &self.options.title;
+            let update = || {
                 let (scene, semantics) = (ui.scene.borrow(), ui.semantics.borrow());
-                let (focused, title) = (ui.input.focused(), &self.options.title);
+                let focused = ui.input.focused();
                 match full {
-                    true => self
-                        .tree
-                        .update(&scene, &semantics, focused, title, self.scale_factor),
-                    false => self.tree.update_names(
-                        &scene,
-                        &semantics,
-                        focused,
-                        title,
-                        self.scale_factor,
-                    ),
+                    true => tree.update(&scene, &semantics, focused, title, scale),
+                    false => tree.update_names(&scene, &semantics, focused, title, scale),
                 }
-            });
+            };
+            #[cfg(test)]
+            match &mut self.accessibility_read {
+                Some(read) => read.extend(std::iter::once_with(update)),
+                None => adapter.update_if_active(update),
+            }
+            #[cfg(not(test))]
+            adapter.update_if_active(update);
         }
         // Pages focus entered send what they held, after the focus above.
         #[cfg(all(target_os = "linux", feature = "webkitgtk"))]
@@ -3157,6 +3334,14 @@ impl Host {
             self.show_error(&message);
         }
         self.show_issues();
+        // The script holds the frame (`Ui::hold_frames`: a page waiting on
+        // its content): nothing drawn, what changed kept for the frame that
+        // shows as it lets go, or as the hold runs out (`about_to_wait`).
+        self.frames_held = self.context.ui.frames_held(std::time::Instant::now());
+        if self.frames_held.is_some() {
+            zgx_gpu::present_log::log(|| "frame held".into());
+            return Ok(());
+        }
         // A large removal's effects are freed a chunk per frame (`Ui::reclaim`,
         // as the frame is prepared): frames keep coming until they are.
         if self.context.ui.reclaiming() {
@@ -3220,6 +3405,11 @@ impl Host {
             joined = self.held_damage.with(&report.damage, full[0]);
             &joined[..]
         };
+        // What a hold kept back shows with this frame, unless it too waits
+        // for one to be granted.
+        if damage.is_empty() || !self.frame_paced || self.present_ready {
+            self.context.ui.held_frame_drawn();
+        }
         // Native views: split this frame's paint into the planes under and
         // over them; paint moving between planes repaints on both.
         let planned = match &mut self.renderer {
@@ -3346,7 +3536,7 @@ impl Host {
                             first_mark(&FIRST_RENDER, "first frame rendered");
                             self.native.render(&scene, damage)?;
                             // Drawn and shown at once: presented.
-                            note_first_present();
+                            note_first_present(|| "the raster".into());
                             // Shown: the next waits for the compositor's
                             // frame, as a GPU present's does.
                             self.present_ready = false;
@@ -3523,7 +3713,17 @@ impl Host {
                     self.scale_factor,
                 );
                 self.native.apply();
-                note_first_present();
+                let from_raster = self.from_raster;
+                note_first_present(|| {
+                    let info = renderer.adapter_info();
+                    format!(
+                        "the GPU on {} ({:?}, {:?}){}",
+                        info.name,
+                        info.device_type,
+                        info.backend,
+                        if from_raster { ", from the raster" } else { "" }
+                    )
+                });
                 // Commits the transaction (macOS; elsewhere there is none).
                 #[allow(dropping_copy_types)]
                 drop(transaction);
@@ -4032,12 +4232,26 @@ impl Host {
             return false;
         }
         if k.eq_ignore_ascii_case("v") {
-            let text = match self.clipboard.borrow_mut().as_mut() {
-                Some(clipboard) => clipboard.get_text().ok(),
+            let (text, atoms) = match self.clipboard.borrow_mut().as_mut() {
+                Some(clipboard) => {
+                    // A copy's atoms, read only for a text area that takes them.
+                    let atoms = editor
+                        .takes_atoms()
+                        .then(|| clipboard.get_types().ok())
+                        .flatten()
+                        .and_then(|types| {
+                            types.into_iter().find_map(|(kind, value)| {
+                                (kind == zgx::widgets::ATOMS_TYPE).then_some(value)
+                            })
+                        });
+                    (clipboard.get_text().ok(), atoms)
+                }
                 None => return true,
             };
             // With the clipboard let go: what hears the paste may read it.
-            self.context.ui.paste_into(&editor, text.as_deref());
+            self.context
+                .ui
+                .paste_into_with(&editor, text.as_deref(), atoms.as_deref());
             return true;
         }
         if self.clipboard.borrow().is_none() {
@@ -4331,6 +4545,7 @@ impl Host {
         let raster = self.raster.take();
         self.recover_renderer();
         if self.renderer.is_some() {
+            self.from_raster = true;
             zgx_gpu::present_log::log(|| "raster to gpu".into());
             // Its popups in windows of their own again, where the platform
             // shows them so.
@@ -4794,6 +5009,7 @@ impl Host {
                 let _ = proxy.send_event(Event::Zoom(token));
             });
         }
+        self.context.ui.set_window_active(window.has_focus());
         self.window = Some(window);
         #[cfg(target_os = "macos")]
         {
@@ -6074,7 +6290,15 @@ impl Host {
                     }
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } => self.key_input(event, true)?,
+            WindowEvent::KeyboardInput { event, .. } => {
+                self.key_input(event, true)?;
+                // What it typed is told at once: an input method has its
+                // next key before any event of the window's.
+                #[cfg(windows)]
+                if let Some(tsf) = &self.tsf {
+                    tsf.after_dispatch();
+                }
+            }
             _ => {}
         }
 
@@ -6886,6 +7110,9 @@ impl Host {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.trim();
                 }
+                if let Some(raster) = &mut self.raster {
+                    raster.trim();
+                }
                 // What goes later, each at its own delay past this trim: the
                 // glyph atlas (a window that grew one), and Metal's queue once
                 // a frame would find it cold anyway.
@@ -6977,8 +7204,16 @@ impl Host {
                 .is_some_and(|link| link.running());
         #[cfg(not(any(target_os = "macos", windows)))]
         let paced = false;
+        // A hold just over, let go or run out, draws now, whatever paces
+        // frames: nothing new need have changed since, so no refresh may be
+        // on its way.
+        let hold_over = hold_ended(
+            &mut self.frames_held,
+            &self.context.ui,
+            std::time::Instant::now(),
+        );
         // Scene damage accumulates until the refresh paints it in one frame.
-        if !paced || due || self.frame_arrived || self.force {
+        if !paced || due || self.frame_arrived || self.force || hold_over {
             #[cfg(target_os = "macos")]
             {
                 self.refresh_frame = paced && self.frame_arrived;
@@ -7058,7 +7293,10 @@ impl Host {
             return;
         }
         self.frame_arrived = true;
-        self.frame_deadline = None;
+        // A native tick leaves the watchdog where it is (`arm_watchdog`).
+        if !self.frame_watchdog {
+            self.frame_deadline = None;
+        }
         self.frame_heartbeat = Some(std::time::Instant::now());
         if self.frames_presented() {
             self.frames.deliver(frame);
@@ -7090,6 +7328,16 @@ impl Host {
     }
     fn poll_frame_deadline(&mut self, now: std::time::Instant) {
         if self.frame_deadline.is_some_and(|deadline| now >= deadline) {
+            // The watchdog, left where it was as the native source ticked
+            // (`arm_watchdog`): due `WATCHDOG` after its last tick.
+            #[cfg(any(target_os = "macos", windows))]
+            if self.frame_watchdog
+                && let Some(due) = watchdog_moved_on(self.frame_heartbeat, now)
+            {
+                self.frame_deadline = Some(due);
+                return;
+            }
+            self.frame_deadline = None;
             #[cfg(target_os = "macos")]
             self.late_sample.start(now);
             let frame = self.frame_timer.frame(now, self.frame_interval);
@@ -7176,6 +7424,16 @@ impl Host {
             self.trim_at = Some(std::time::Instant::now() + TRIM_DELAY);
             self.trim_stage = TrimStage::Trim;
         }
+    }
+    /// The native source's watchdog: due `WATCHDOG` after its last tick
+    /// (`frame_heartbeat`). Left where it is as ticks come, each frame, and
+    /// moved on only as it falls due (`poll_frame_deadline`): moved each
+    /// tick, the event loop armed its timer again each frame.
+    #[cfg(any(target_os = "macos", windows))]
+    fn arm_watchdog(&mut self, now: std::time::Instant) {
+        let heartbeat = *self.frame_heartbeat.get_or_insert(now);
+        self.frame_deadline = watchdog_armed(self.frame_watchdog, self.frame_deadline, heartbeat);
+        self.frame_watchdog = true;
     }
     /// Start, stop or schedule this window's frame source to match demand.
     fn sync_frames(&mut self) {
@@ -7273,6 +7531,7 @@ impl Host {
                         let next =
                             self.frame_timer
                                 .next_deadline_every(now, self.frame_interval, every);
+                        self.frame_watchdog = false;
                         self.frame_deadline = Some(if scrolling && every == 1 {
                             self.late_sample.deadline(now, next, self.frame_interval)
                         } else {
@@ -7281,8 +7540,7 @@ impl Host {
                     }
                 } else {
                     link.set_preferred_rate(rate);
-                    let heartbeat = *self.frame_heartbeat.get_or_insert(now);
-                    self.frame_deadline = Some(heartbeat + crate::frame_source::WATCHDOG);
+                    self.arm_watchdog(now);
                 }
             }
             return;
@@ -7314,8 +7572,7 @@ impl Host {
                 link.set_preferred_rate(rate);
                 link.set_running(wanted);
                 if wanted {
-                    let heartbeat = *self.frame_heartbeat.get_or_insert(now);
-                    self.frame_deadline = Some(heartbeat + crate::frame_source::WATCHDOG);
+                    self.arm_watchdog(now);
                 }
                 return;
             }
@@ -7333,6 +7590,7 @@ impl Host {
             return;
         }
         if self.frame_deadline.is_none() {
+            self.frame_watchdog = false;
             self.frame_deadline = Some(self.frame_timer.next_deadline(now, self.frame_interval));
         }
     }
@@ -7434,9 +7692,7 @@ impl Drop for Host {
             window.set_visible(false);
         }
         self.pending.borrow_mut().clear();
-        if let Some(callback) = self.context.closed.take() {
-            callback();
-        }
+        self.context.closed.run();
         // The renderer's surface first, while its window still is (fields
         // drop in order, and `window` comes before `renderer`); then its
         // Metal layer leaves the view. The layer (raw-window-metal's)
@@ -8352,6 +8608,26 @@ impl WindowManager {
             Event::Quit => event_loop.exit(),
             #[cfg(feature = "audio")]
             Event::AudioVoicesEnded => crate::audio::voices_ended(),
+            Event::QuitRequested => {
+                let order = ask_order(self.hosts.iter().map(|(token, host)| {
+                    #[cfg(target_os = "macos")]
+                    let key = host.window.as_ref().is_some_and(|w| is_key_window(w));
+                    #[cfg(not(target_os = "macos"))]
+                    let key = {
+                        let _ = host;
+                        false
+                    };
+                    (*token, key)
+                }));
+                let allowed = order.into_iter().all(|token| {
+                    (self.hosts.get_mut(&token))
+                        .and_then(|host| host.context.close_requested.as_mut())
+                        .is_none_or(|callback| callback())
+                });
+                if allowed {
+                    event_loop.exit();
+                }
+            }
             #[cfg(target_os = "macos")]
             Event::FullScreen => self.apply_full_screen(),
             Event::Application(event, token) => {
@@ -8924,6 +9200,7 @@ impl WindowManager {
                     host.popups.deadline(),
                     host.renderer_retry,
                     host.plane_retry,
+                    host.frames_held,
                     host.touch.hold_deadline(),
                     host.trim_at,
                     host.release_images_at,
@@ -9042,6 +9319,15 @@ impl ApplicationHandler<Event> for WindowManager {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         self.flush_move(event_loop);
         self.contain(event_loop, None, |this| this.about_to_wait_turn(event_loop));
+        // An edit a task, a timer or the app made this turn is told before
+        // the next message: an input method asks then, and can't be told
+        // as it does (`tsf::grant`). A comparison where nothing changed.
+        #[cfg(windows)]
+        self.contain(event_loop, None, |this| {
+            for tsf in this.hosts.values().filter_map(|host| host.tsf.as_ref()) {
+                tsf.after_dispatch();
+            }
+        });
     }
     /// The windows still open (`Application::quit`, a failure) close while
     /// the event loop is still there, not after `run_app` returns. On Linux
@@ -9050,17 +9336,71 @@ impl ApplicationHandler<Event> for WindowManager {
     /// its last window), and what a window holds on it would go after: its
     /// renderer's surface and its popups' (Mesa's WSI destroys their
     /// buffers and queues through the display), and its pointer grab
-    /// (`popup_window::x11::release_grab`), all through freed memory.
-    #[cfg(target_os = "linux")]
+    /// (`popup_window::x11::release_grab`), all through freed memory. On
+    /// macOS a quit AppKit carries out (`terminate:`) exits the process after
+    /// this: `run_app` never returns to close a window still open.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn exiting(&mut self, event_loop: &ActiveEventLoop) {
-        self.contain(event_loop, None, |this| {
-            let open: Vec<u64> = this.hosts.keys().copied().collect();
-            for token in open {
-                this.close(token);
-            }
-        });
+        let open: Vec<u64> = self.hosts.keys().copied().collect();
+        for token in open {
+            // Each on its own: one whose `on_closed` panics keeps none open.
+            self.contain(event_loop, None, |this| this.close(token));
+        }
     }
 }
+thread_local! {
+    /// Where the last panic on this thread was (`file:line`), noted by the
+    /// hook `note_panic_sites` installs: a contained panic's banner names it.
+    static PANIC_SITE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A caught panic's `message`, led by where it was (`src/app.rs:42: …`), as
+/// a script's error says where it failed: the site `note_panic_sites`
+/// noted, taken.
+/// A host callback a script called that the panic unwound through (an
+/// action, a function, the fetcher) is named after, with where it was
+/// registered: the panic may be deep in a library the callback used.
+pub(crate) fn with_panic_site(message: String) -> String {
+    let message = match PANIC_SITE.with(|site| site.take()) {
+        Some(site) => format!("{site}: {message}"),
+        None => message,
+    };
+    match zgx::callback_site::take() {
+        Some((kind, at)) => format!(
+            "{message} (in {kind} registered at {}:{})",
+            at.file(),
+            at.line()
+        ),
+        None => message,
+    }
+}
+
+/// Note where each panic is (`PANIC_SITE`), then report it as before: the
+/// hook in place stays the one that reports (stderr, an app's own), called
+/// after. Once for the process.
+pub(crate) fn note_panic_sites() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // A site an earlier panic left (one caught elsewhere) is not
+            // this one's: what it unwinds through notes its own.
+            zgx::callback_site::clear();
+            if let Some(at) = info.location() {
+                let site = format!("{}:{}", at.file(), at.line());
+                // A panic while the slot is borrowed (none is held across
+                // code that panics) leaves it: never a second panic.
+                let _ = PANIC_SITE.try_with(|slot| {
+                    if let Ok(mut slot) = slot.try_borrow_mut() {
+                        *slot = Some(site);
+                    }
+                });
+            }
+            previous(info);
+        }));
+    });
+}
+
 impl WindowManager {
     /// Run one turn of the event loop. A panic in it (an app's handler or
     /// effect) is contained: the panic hook has logged it, its window (or
@@ -9083,6 +9423,7 @@ impl WindowManager {
             .map(|s| s.to_string())
             .or_else(|| payload.downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "a panic".into());
+        let message = with_panic_site(message);
         let now = std::time::Instant::now();
         self.panics
             .retain(|at| now.duration_since(*at) < std::time::Duration::from_secs(1));
@@ -9459,6 +9800,15 @@ impl FrameDamage {
         self.0.clear();
     }
 }
+/// Whether the hold `held` says the window draws under (`Ui::hold_frames`) is
+/// over at `now`: let go, or run out. Said once.
+fn hold_ended(
+    held: &mut Option<std::time::Instant>,
+    ui: &zgx::widgets::Ui,
+    now: std::time::Instant,
+) -> bool {
+    held.take_if(|_| ui.frames_held(now).is_none()).is_some()
+}
 /// A frame the compositor hasn't granted yet: its `damage`, and every view
 /// its flush scrolled, whole. A scroll's flush damages only what copying
 /// the view's old pixels can't give (`ScrollMove`), and the copy is good
@@ -9733,13 +10083,15 @@ fn first_mark(once: &std::sync::Once, what: &str) {
 /// `ZGX_SHADER_LOG=1`, written alone to stderr: what a probe times a start
 /// by, or waits on before reading the window's pixels (ZGX_PROFILE's spans
 /// would slow them). The GPU renderer's present and the raster window's
-/// (drawn and shown at once) alike.
-fn note_first_present() {
+/// (drawn and shown at once) alike; the line also says which drew it
+/// (`drawn_by`, asked only for that line), so a probe's evidence names the
+/// path a failed run took.
+fn note_first_present(drawn_by: impl FnOnce() -> String) {
     FIRST_PRESENT.call_once(|| {
         let mark = first_present_mark();
         zgx::profile::mark(&mark);
         if zgx::env::var_os("ZGX_SHADER_LOG").is_some_and(|v| v != "0") {
-            eprintln!("zgx: {mark}");
+            eprintln!("zgx: {mark}, drawn by {}", drawn_by());
         }
     });
 }
@@ -9832,9 +10184,83 @@ fn copy_or_cut_editor(
 ) -> bool {
     ui.copy_from(editor, cut, write)
 }
+
+/// The native source's watchdog deadline, armed (`Host::arm_watchdog`):
+/// where it was while it stands, else `WATCHDOG` after the last tick.
+#[cfg(any(target_os = "macos", windows))]
+fn watchdog_armed(
+    armed: bool,
+    deadline: Option<std::time::Instant>,
+    heartbeat: std::time::Instant,
+) -> Option<std::time::Instant> {
+    match deadline {
+        Some(deadline) if armed => Some(deadline),
+        _ => Some(heartbeat + crate::frame_source::WATCHDOG),
+    }
+}
+
+/// The watchdog falling due at `now` (`Host::poll_frame_deadline`): where
+/// it moves on to, `WATCHDOG` after the last tick, if a tick came since; else
+/// none (it fires).
+#[cfg(any(target_os = "macos", windows))]
+fn watchdog_moved_on(
+    heartbeat: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> Option<std::time::Instant> {
+    heartbeat
+        .map(|beat| beat + crate::frame_source::WATCHDOG)
+        .filter(|due| *due > now)
+}
+
 #[cfg(test)]
 mod tests {
     use zgx::scene::Rect;
+
+    /// A native source ticking at 120 Hz arms the watchdog each frame; its
+    /// deadline moves only as it falls due (about four times a second, not
+    /// each frame), and a link that stops ticking is backed up exactly
+    /// `WATCHDOG` after its last tick. (macOS and Windows: the native frame
+    /// sources and their watchdog.)
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn the_watchdog_stays_put_while_ticks_come_and_fires_after_the_last() {
+        use std::time::{Duration, Instant};
+        let watchdog = crate::frame_source::WATCHDOG;
+        let start = Instant::now();
+        let frame = Duration::from_micros(8_333);
+        let (mut deadline, mut armed, mut heartbeat) = (None, false, start);
+        let mut moves = 0;
+        let mut last = None;
+        // A second of ticks: each one the heartbeat, then the watchdog armed;
+        // the event loop polls the deadline as it comes.
+        for k in 1..=120u32 {
+            let now = start + frame * k;
+            if deadline.is_some_and(|d| now >= d) {
+                deadline = watchdog_moved_on(Some(heartbeat), now);
+                armed = deadline.is_some();
+            }
+            heartbeat = now;
+            deadline = watchdog_armed(armed, deadline, heartbeat);
+            armed = true;
+            if deadline != last {
+                moves += 1;
+                last = deadline;
+            }
+        }
+        assert!(moves <= 6, "the deadline moved {moves} times in 120 frames");
+        // The link stops: the deadline falls due once more, moves on to
+        // `WATCHDOG` after the last tick, and then fires.
+        let mut now = deadline.unwrap();
+        while let Some(next) = watchdog_moved_on(Some(heartbeat), now) {
+            assert!(next > now);
+            now = next;
+        }
+        assert_eq!(
+            now,
+            heartbeat + watchdog,
+            "it fires WATCHDOG after the last tick"
+        );
+    }
 
     /// A frame answers input that acted within `INPUT_LIVE` of it, and not
     /// after; no input, none.
@@ -10245,17 +10671,147 @@ mod tests {
         assert_eq!(held.take(), Some((2, "b2", vec!["b1"])));
     }
 
-    /// Every `on_closed` handler runs, in order: a window's own state and
-    /// its `open` state each had one, and the second dropped the first.
+    /// Every `on_closed` handler runs once, in order: a window's own state
+    /// and its `open` state each had one, and the second dropped the first.
     #[test]
-    fn closing_runs_every_handler_given_in_order() {
-        let ran = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let (a, b, c) = (ran.clone(), ran.clone(), ran.clone());
-        let handler = super::then(None, move || a.borrow_mut().push(1));
-        let handler = super::then(Some(handler), move || b.borrow_mut().push(2));
-        let handler = super::then(Some(handler), move || c.borrow_mut().push(3));
-        handler();
+    fn closing_runs_every_handler_given_in_order_once() {
+        let (window, ran) = recording(&[1, 2, 3]);
+        window.run();
+        window.run();
         assert_eq!(*ran.borrow(), [1, 2, 3]);
+    }
+    type Ran = std::rc::Rc<std::cell::RefCell<Vec<i32>>>;
+    /// A window's handlers (found at a session's end, as a window's are),
+    /// each noting its number; a negative one panics.
+    fn recording(numbers: &[i32]) -> (std::rc::Rc<super::ClosedHandlers>, Ran) {
+        let window = super::closed_handlers();
+        let ran = Ran::default();
+        for &n in numbers {
+            let ran = ran.clone();
+            window.0.borrow_mut().push_back(Box::new(move || {
+                assert!(n >= 0, "handler {n}");
+                ran.borrow_mut().push(n);
+            }));
+        }
+        (window, ran)
+    }
+    /// What a quit asks and runs: `may_quit`'s answer, then how often it
+    /// asked and closed.
+    fn quit(reason: Option<&[u8; 4]>, handlers: bool) -> (super::Quit, i32, i32) {
+        let (asked, closed) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+        let allowed = super::may_quit(
+            reason.copied(),
+            handlers,
+            || closed.set(closed.get() + 1),
+            || asked.set(asked.get() + 1),
+        );
+        (allowed, asked.get(), closed.get())
+    }
+
+    #[test]
+    fn a_logout_a_restart_and_a_shutdown_end_the_session_and_quit_all_does_not() {
+        for reason in [b"rlgo", b"rest", b"shut", b"logo", b"rrst", b"rsdn"] {
+            assert!(super::ends_session(*reason), "{reason:?}");
+        }
+        // kAEQuitAll, a quit's own code, and nothing.
+        for reason in [b"quia", b"quit", b"\0\0\0\0"] {
+            assert!(!super::ends_session(*reason), "{reason:?}");
+        }
+    }
+
+    /// The reason's read from where an event may hold it. (The events are
+    /// made here and sent nowhere.)
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_quit_events_reason_is_read_as_an_attribute_or_a_parameter() {
+        use objc2_foundation::NSAppleEventDescriptor;
+        let code = |c: &[u8; 4]| u32::from_be_bytes(*c);
+        let event = || {
+            NSAppleEventDescriptor::appleEventWithEventClass_eventID_targetDescriptor_returnID_transactionID(
+                code(b"aevt"), code(b"quit"), None, -1, 0,
+            )
+        };
+        let reason = NSAppleEventDescriptor::descriptorWithTypeCode(code(b"rlgo"));
+        assert_eq!(super::quit_reason(&event()), None);
+        let given = event();
+        given.setParamDescriptor_forKeyword(&reason, code(b"why?"));
+        assert_eq!(super::quit_reason(&given), Some(*b"rlgo"));
+        let given = event();
+        given.setAttributeDescriptor_forKeyword(&reason, code(b"why?"));
+        assert_eq!(super::quit_reason(&given), Some(*b"rlgo"));
+    }
+
+    #[test]
+    fn a_quit_asks_the_key_window_first_then_the_rest_as_they_opened() {
+        let windows = [(7, false), (2, false), (5, true), (3, false)];
+        assert_eq!(super::ask_order(windows.into_iter()), [5, 2, 3, 7]);
+        let none = [(7, false), (2, false)];
+        assert_eq!(super::ask_order(none.into_iter()), [2, 7]);
+    }
+
+    /// ⌘Q asks (once, and waits) if a window has something to ask, and
+    /// otherwise goes on; a session's end asks nothing and runs `on_closed`
+    /// before it answers, whether or not a window would ask.
+    #[test]
+    fn a_quit_asks_and_a_sessions_end_closes() {
+        use super::Quit::{Cancel, EndSession, Now};
+        assert_eq!(quit(None, true), (Cancel, 1, 0));
+        assert_eq!(quit(Some(b"quia"), true), (Cancel, 1, 0));
+        assert_eq!(quit(None, false), (Now, 0, 0));
+        assert_eq!(quit(Some(b"shut"), true), (EndSession, 0, 1));
+        assert_eq!(quit(Some(b"shut"), false), (EndSession, 0, 1));
+    }
+
+    /// A session's end, then the app's exit: each handler ran once, and a
+    /// panic in one stops neither its window's others nor another window's.
+    #[test]
+    fn a_sessions_end_runs_every_windows_handlers_once_past_a_panic() {
+        let (a, ran_a) = recording(&[1, -1, 2]);
+        let (b, ran_b) = recording(&[3]);
+        let answer = super::may_quit(Some(*b"rlgo"), true, super::run_all_closed, || {
+            panic!("a session's end asks nothing")
+        });
+        assert_eq!(answer, super::Quit::EndSession);
+        assert_eq!(
+            (&*ran_a.borrow(), &*ran_b.borrow()),
+            (&vec![1, 2], &vec![3])
+        );
+        // The exit closes them.
+        a.run();
+        b.run();
+        super::run_all_closed();
+        assert_eq!(
+            (&*ran_a.borrow(), &*ran_b.borrow()),
+            (&vec![1, 2], &vec![3])
+        );
+    }
+
+    /// The session ending as a window closes (its handler lets AppKit run):
+    /// the one running isn't run again, and those left run once.
+    #[test]
+    fn a_session_ending_as_a_window_closes_runs_nothing_twice() {
+        let (window, ran) = recording(&[]);
+        let notes = ran.clone();
+        window.0.borrow_mut().push_back(Box::new(move || {
+            notes.borrow_mut().push(1);
+            super::run_all_closed();
+        }));
+        let notes = ran.clone();
+        window
+            .0
+            .borrow_mut()
+            .push_back(Box::new(move || notes.borrow_mut().push(2)));
+        window.run();
+        assert_eq!(*ran.borrow(), [1, 2]);
+    }
+
+    /// A closed window's handlers are let go.
+    #[test]
+    fn a_closed_window_is_not_kept_for_a_sessions_end() {
+        let (window, ran) = recording(&[1]);
+        drop(window);
+        super::run_all_closed();
+        assert!(ran.borrow().is_empty());
     }
     use super::*;
 
@@ -11260,6 +11816,302 @@ mod tests {
             40. + step
         );
         assert_eq!(probe.clicks, 1, "the pointer tape pressed the button once");
+    }
+
+    /// A hold let go, or run out, is over once, with nothing new changed.
+    #[test]
+    fn a_hold_let_go_or_run_out_is_over_once() {
+        use std::time::{Duration, Instant};
+        let ui = zgx::widgets::Ui::new(100., 100.);
+        let now = Instant::now;
+        let mut held = None;
+        assert!(!hold_ended(&mut held, &ui, now()), "none held");
+        ui.held_frame_drawn();
+        ui.hold_frames(Duration::from_millis(200));
+        held = ui.frames_held(now());
+        let until = held.expect("held");
+        assert!(!hold_ended(&mut held, &ui, now()), "still held");
+        assert_eq!(held, Some(until), "and waited for");
+        ui.release_frames();
+        assert!(hold_ended(&mut held, &ui, now()), "let go");
+        assert!(!hold_ended(&mut held, &ui, now()), "said once");
+        ui.held_frame_drawn();
+        ui.hold_frames(Duration::from_millis(200));
+        held = ui.frames_held(now());
+        let until = held.expect("held again");
+        assert!(hold_ended(&mut held, &ui, until), "run out");
+        assert!(!hold_ended(&mut held, &ui, until), "said once");
+    }
+
+    /// A held window rests: its loop turns for the hold's end alone, and no
+    /// redraw is asked for. Let go in a later turn, with nothing changed
+    /// since, what it held back draws in that turn.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an owned X11 display and GPU; run alone with --test-threads=1"]
+    fn a_held_window_rests_and_draws_as_it_is_let_go() {
+        use std::time::{Duration, Instant};
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        use zgx::compose::prelude::*;
+        const SETTLE: Duration = Duration::from_millis(700);
+        const HELD: Duration = Duration::from_millis(150);
+        struct Probe {
+            factory: WindowFactory,
+            host: Option<Host>,
+            wide: Option<zgx::reactive::Signal<f32>>,
+            settle: Instant,
+            release: Option<Instant>,
+            drawn: u64,
+            turns: u32,
+            redraws: u32,
+            completed: bool,
+        }
+        impl ApplicationHandler<Event> for Probe {
+            fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+                let handle = self.factory.allocate();
+                let mut host = Host::new(WindowOptions::default(), handle, self.factory.clone());
+                let ui = &mut host.context.ui;
+                let wide = ui.signal(20.);
+                let width = wide.clone();
+                let _view = ui.mount(
+                    div()
+                        .h(20.)
+                        .reactive_style(move || Styles::new().w(width.get()).bg(rgb(0x808080))),
+                );
+                host.create_window(event_loop).unwrap();
+                self.wide = Some(wide);
+                self.host = Some(host);
+                self.settle = Instant::now() + SETTLE;
+            }
+            fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+                let host = self.host.as_mut().unwrap();
+                if matches!(event, WindowEvent::RedrawRequested) {
+                    if self.release.is_some() {
+                        self.redraws += 1;
+                    }
+                    host.draw().unwrap();
+                }
+            }
+            fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+                let Some(host) = &mut self.host else { return };
+                let now = Instant::now();
+                match self.release {
+                    // The window's own first frames, done with.
+                    None if now < self.settle => {
+                        host.update().unwrap();
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(self.settle));
+                    }
+                    None => {
+                        host.update().unwrap();
+                        assert!(host.frames_tried > 0, "the window drew");
+                        self.drawn = host.frames_tried;
+                        host.context.ui.hold_frames(Duration::from_millis(250));
+                        self.wide.as_ref().unwrap().set(60.);
+                        assert!(!host.update().unwrap(), "no turn is owed at once");
+                        assert_eq!(host.frames_tried, self.drawn, "nothing drawn");
+                        let until = host.frames_held.expect("held");
+                        assert!(until > now + HELD, "and its end waited for");
+                        self.release = Some(now + HELD);
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(now + HELD));
+                    }
+                    Some(release) if now < release => {
+                        self.turns += 1;
+                        assert!(!host.update().unwrap());
+                        assert_eq!(host.frames_tried, self.drawn, "still held");
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(release));
+                    }
+                    Some(_) => {
+                        // A later turn: nothing has changed since.
+                        host.context.ui.release_frames();
+                        host.update().unwrap();
+                        assert_eq!(host.frames_tried, self.drawn + 1, "drawn as it was let go");
+                        assert_eq!(host.frames_held, None);
+                        println!("held: {} turns, {} redraws", self.turns, self.redraws);
+                        assert!(self.turns <= 3, "{} turns while held", self.turns);
+                        assert_eq!(self.redraws, 0, "redraws asked for while held");
+                        // And one it wasn't asked for again: nothing to draw.
+                        host.update().unwrap();
+                        assert_eq!(host.frames_tried, self.drawn + 1, "drawn once");
+                        self.completed = true;
+                        host.suspend();
+                        event_loop.exit();
+                    }
+                }
+            }
+        }
+        let event_loop = EventLoop::<Event>::with_user_event()
+            .with_x11()
+            .with_any_thread(true)
+            .build()
+            .unwrap();
+        let factory = WindowFactory {
+            fonts: Default::default(),
+            text_language: Default::default(),
+            file_routes: Default::default(),
+            application_id: None,
+            activation: Rc::default(),
+            menus: Rc::new(RefCell::new(Vec::new())),
+            menus_left_out: Rc::default(),
+            reserved: Rc::default(),
+            pending: Rc::new(RefCell::new(VecDeque::new())),
+            next: Rc::new(Cell::new(1)),
+            alive: Rc::new(Cell::new(true)),
+            clipboard: Rc::new(RefCell::new(None)),
+            gpu_contexts: Rc::new(RefCell::new(Vec::new())),
+            #[cfg(any(target_os = "macos", windows))]
+            early_gpu: Rc::default(),
+            proxy: event_loop.create_proxy(),
+            runtime: zgx::reactive::Runtime::new(),
+        };
+        let mut probe = Probe {
+            factory,
+            host: None,
+            wide: None,
+            settle: Instant::now(),
+            release: None,
+            drawn: 0,
+            turns: 0,
+            redraws: 0,
+            completed: false,
+        };
+        event_loop.run_app(&mut probe).unwrap();
+        assert!(probe.completed);
+    }
+
+    /// A geometry change held for pacing falls due in the event loop's turn
+    /// after a handler unmounted part of the window, before the frame that
+    /// shows it: the client is sent the tree without it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an owned X11 display and GPU; run alone with --test-threads=1"]
+    fn a_held_accessibility_update_due_before_the_frame_drops_what_unmounted() {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        use zgx::compose::prelude::*;
+        struct Probe {
+            factory: WindowFactory,
+            completed: bool,
+        }
+        impl ApplicationHandler<Event> for Probe {
+            fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+                let handle = self.factory.allocate();
+                let mut host = Host::new(WindowOptions::default(), handle, self.factory.clone());
+                let ui = &mut host.context.ui;
+                ui.set_assistive_technology(true);
+                let (open, wide) = (ui.signal(true), ui.signal(20.));
+                let (shown, name, width) = (open.clone(), open.clone(), wide.clone());
+                let _view = ui.mount(
+                    row().w(400.).h(300.).children([
+                        switch_or_none(
+                            move || shown.get(),
+                            move |open, _| {
+                                let width = width.clone();
+                                open.then(|| {
+                                    div()
+                                        .w(200.)
+                                        .h(300.)
+                                        .role(Role::Group)
+                                        .accessible_label("Sidebar")
+                                        .child(div().h(20.).reactive_style(move || {
+                                            Styles::new().w(width.get()).bg(rgb(0x808080))
+                                        }))
+                                })
+                            },
+                        ),
+                        // What says the sidebar went, and enough beside it
+                        // that an update looks at what changed alone.
+                        column().children(
+                            std::iter::once(div().h(20.).role(Role::Group).accessible_label_when(
+                                move || {
+                                    match name.get() {
+                                        true => "Hide",
+                                        false => "Show",
+                                    }
+                                    .into()
+                                },
+                            ))
+                            .chain((0..10).map(|i| {
+                                div()
+                                    .h(20.)
+                                    .role(Role::Group)
+                                    .accessible_label(format!("Row {i}"))
+                            })),
+                        ),
+                    ]),
+                );
+                host.create_window(event_loop).unwrap();
+                host.accessibility_read = Some(Vec::new());
+                // Not mapped yet, as the loop begins: drawn all the same.
+                host.draw_hidden = true;
+                // The first tree, and quiet.
+                for _ in 0..3 {
+                    host.force = true;
+                    host.draw().unwrap();
+                    std::thread::sleep(crate::accessibility::GEOMETRY_EVERY);
+                    host.update().unwrap();
+                }
+                // One move goes out at once, and the next is held.
+                for width in [30., 40.] {
+                    wide.set(width);
+                    host.draw().unwrap();
+                }
+                let due = host.accessibility_pacer.deadline().expect("held");
+                let sent = host.accessibility_read.as_ref().unwrap().len();
+                // A handler closes the sidebar; its frame is yet to come as
+                // the held update falls due.
+                open.set(false);
+                std::thread::sleep(due.saturating_duration_since(std::time::Instant::now()));
+                host.update().unwrap();
+                let read = host.accessibility_read.as_ref().unwrap();
+                // The held update, sent before the turn went on to draw.
+                let held = read.get(sent).expect("the held update went out");
+                let sidebar = read[..sent]
+                    .iter()
+                    .flat_map(|update| &update.nodes)
+                    .find(|(_, node)| node.label() == Some("Sidebar"))
+                    .expect("told of the sidebar")
+                    .0;
+                let root = held.tree.as_ref().unwrap().root;
+                let window = held.nodes.iter().find(|(id, _)| *id == root);
+                assert!(
+                    window.is_some_and(|(_, node)| !node.children().contains(&sidebar)),
+                    "the window is told it no longer holds the sidebar"
+                );
+                self.completed = true;
+                host.suspend();
+                event_loop.exit();
+            }
+            fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
+        }
+        let event_loop = EventLoop::<Event>::with_user_event()
+            .with_x11()
+            .with_any_thread(true)
+            .build()
+            .unwrap();
+        let factory = WindowFactory {
+            fonts: Default::default(),
+            text_language: Default::default(),
+            file_routes: Default::default(),
+            application_id: None,
+            activation: Rc::default(),
+            menus: Rc::new(RefCell::new(Vec::new())),
+            menus_left_out: Rc::default(),
+            reserved: Rc::default(),
+            pending: Rc::new(RefCell::new(VecDeque::new())),
+            next: Rc::new(Cell::new(1)),
+            alive: Rc::new(Cell::new(true)),
+            clipboard: Rc::new(RefCell::new(None)),
+            gpu_contexts: Rc::new(RefCell::new(Vec::new())),
+            #[cfg(any(target_os = "macos", windows))]
+            early_gpu: Rc::default(),
+            proxy: event_loop.create_proxy(),
+            runtime: zgx::reactive::Runtime::new(),
+        };
+        let mut probe = Probe {
+            factory,
+            completed: false,
+        };
+        event_loop.run_app(&mut probe).unwrap();
+        assert!(probe.completed);
     }
 
     #[cfg(target_os = "linux")]

@@ -74,6 +74,7 @@ SMOKES = [
     ("native-platform", "python3 scripts/native_platform_smoke.py {bin}/native_platform --output {out}", False),
     ("keyboard-layout", "python3 scripts/keyboard_layout_smoke.py {bin}/primary_selection --output {out}", False),
     ("popup-windows", "python3 scripts/popup_windows_smoke.py {bin}/popup_probe --output {out}", False),
+    ("x11-no-randr", "python3 scripts/x11_no_randr_smoke.py {bin}/popup_probe --output {out}", False),
     ("decision-controls", "python3 scripts/decision_probe_smoke.py {bin}/decision_probe --output {out}", False),
     ("sealed-regions", "python3 scripts/decision_probe_smoke.py {bin}/decision_probe --sealed --output {out}", False),
     ("wayland-popups", "python3 scripts/wayland_popups_smoke.py {bin}/popup_probe --output {out}", False),
@@ -136,7 +137,9 @@ SMOKES = [
     ("clipboard-html", "python3 scripts/clipboard_html_smoke.py {bin}/clipboard_html --output {out}", False),
     ("clipboard-html-x11", "cargo test -p zgx-desktop --lib clipboard::tests::html_and_its_text_round_trip_through_the_system_clipboard --locked -- --ignored --exact --test-threads=1", True),
     ("clipboard-types", "python3 scripts/clipboard_types_smoke.py {bin}/clipboard_types --output {out}", False),
+    ("clipboard-atoms", "python3 scripts/clipboard_atoms_smoke.py {bin}/clipboard_atoms --output {out}", False),
     ("clipboard-types-x11", "cargo test -p zgx-desktop --lib clipboard::tests::types_round_trip_through_the_system_clipboard --locked -- --ignored --exact --test-threads=1", True),
+    ("clipboard-typed-image-x11", "cargo test -p zgx-desktop --lib clipboard::tests::an_image_with_its_text_and_types_round_trips_through_the_system_clipboard --locked -- --ignored --exact --test-threads=1", True),
     ("selectable-text", "python3 scripts/selectable_text_smoke.py {bin}/selectable_text --output {out}", False),
     ("find-in-page", "python3 scripts/find_in_page_smoke.py {bin}/selectable_text --output {out}", False),
     ("zoom", "python3 scripts/zoom_smoke.py {bin}/zoom_probe --output {out}", False),
@@ -144,15 +147,18 @@ SMOKES = [
     ("covered-window", "python3 scripts/covered_window_smoke.py {bin}/../zgx-run --output {out}", False),
     ("inspect-memory", "python3 scripts/inspect_memory_smoke.py {bin}/../zgx-run --output {out}", False),
     ("window-state", "python3 scripts/window_state_smoke.py {bin}/../zgx-run --output {out}", False),
+    ("native-modules", "python3 scripts/native_modules_smoke.py {bin}/../zgx-run --output {out}", False),
     ("editor-autoscroll", "python3 scripts/editor_autoscroll_smoke.py {bin}/editor_autoscroll --output {out}", False),
     ("transparency", "python3 scripts/transparency_smoke.py {bin}/transparency --output {out}", False),
     ("wayland-transparency", "python3 scripts/wayland_transparency_smoke.py {bin}/transparency --output {out}", False),
     ("covers-display-wayland", "python3 scripts/covers_display_smoke.py {bin}/agents_intro --output {out}", False),
     ("native-ime", "python3 scripts/native_ime_smoke.py {bin}/native_ime --output {out}", False),
+    ("native-ime-atom", "python3 scripts/native_ime_smoke.py {bin}/native_ime --atom --output {out}", False),
     ("ime-server-gone", "python3 scripts/native_ime_smoke.py {bin}/native_ime --server-gone --output {out}", False),
     ("ime-server-stopped", "python3 scripts/native_ime_smoke.py {bin}/native_ime --server-stopped --output {out}", False),
     ("ime-password", "python3 scripts/native_ime_smoke.py {bin}/native_ime --password --output {out}", False),
     ("wayland-ime", "python3 scripts/wayland_ime_smoke.py {bin}/native_ime --output {out}", False),
+    ("wayland-ime-atom", "python3 scripts/wayland_ime_smoke.py {bin}/native_ime --atom --output {out}", False),
     ("wayland-input-modes", "python3 scripts/wayland_ime_smoke.py {bin}/native_ime --input-modes --output {out}", False),
     ("wayland-ime-burst", "python3 scripts/wayland_ime_smoke.py {bin}/native_ime --burst --output {out}", False),
     ("wayland-external-ime", "python3 scripts/wayland_external_ime_smoke.py {bin}/external_ime --output {out}", False),
@@ -167,6 +173,8 @@ SMOKES = [
     ("letter-spacing", "python3 scripts/letter_spacing_smoke.py {bin}/letter_spacing --output {out}", False),
     ("clipboard-shutdown", "cargo test -p zgx-desktop --lib retained_window_factory_releases_native_clipboard_after_manager_shutdown --locked -- --ignored --test-threads=1", True),
     ("host-suspend", "cargo test -p zgx-desktop --lib host_suspend_recreates_native_resources_and_retains_editor_state --locked -- --ignored --test-threads=1", True),
+    ("accessibility-between-frames", "cargo test -p zgx-desktop --lib a_held_accessibility_update_due_before_the_frame_drops_what_unmounted --locked -- --ignored --test-threads=1", True),
+    ("held-frames", "cargo test -p zgx-desktop --lib a_held_window_rests_and_draws_as_it_is_let_go --locked -- --ignored --test-threads=1", True),
     ("exit-closes-windows", "cargo test -p zgx-desktop --lib windows_still_open_close_before_the_event_loop_ends --locked -- --ignored --test-threads=1", True),
     ("wheel-tape", "cargo test -p zgx-desktop --lib a_wheel_tape_plays_back_through_the_windows_input_path --locked -- --ignored --test-threads=1", True),
     ("atspi", "/usr/bin/python3 scripts/atspi_smoke.py {bin}/atspi --output {out}", False),
@@ -219,7 +227,7 @@ COST = {
     "wayland-ime-burst": 8,
     "native-menus": 12, "native-menus-wayland": 12,
     "wayland-input": 13,
-    "clipboard-shutdown": 3, "host-suspend": 3, "exit-closes-windows": 3,
+    "clipboard-shutdown": 3, "host-suspend": 3, "exit-closes-windows": 3, "held-frames": 3, "accessibility-between-frames": 3,
 }
 
 
@@ -283,16 +291,23 @@ def drew_on_raster(output, probe_log, logs_present=False):
     else it passed on the GPU. With `ZGX_SHADER_LOG=1` (`logs_present`)
     they show its first present marked too (`zgx: first frame presented`),
     as a GPU window's is: what a probe waits on before reading pixels, and
-    the menu bar's wait on macOS. 0, or a status saying why."""
+    the menu bar's wait on macOS; and saying the raster drew it (`drawn by
+    the raster`), as a failed probe's evidence names its path. 0, or a
+    status saying why."""
     logs = [probe_log, *(p for p in output.rglob("*.log") if p.is_file())] if output.exists() else [probe_log]
     text = "\n".join(p.read_text(errors="replace") for p in logs)
     raster, gpu = text.count("raster present"), text.count("render forced=")
     marked = "zgx: first frame presented" in text
+    named = ", drawn by the raster" in text
     with probe_log.open("a") as log:
         print(f"raster check: {raster} raster presents, {gpu} GPU renders, first present marked: {marked}", file=log)
     if not (raster and not gpu):
         return "not on the raster"
-    return 0 if marked or not logs_present else "the raster window never marked its first present"
+    if not logs_present:
+        return 0
+    if not marked:
+        return "the raster window never marked its first present"
+    return 0 if named else "the first present's line didn't say the raster drew it"
 
 
 def main():

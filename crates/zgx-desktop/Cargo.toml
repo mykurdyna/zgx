@@ -74,7 +74,7 @@ winit = "0.30.13"
 softbuffer = "0.4.8"
 fontdue = "0.9.3"
 cosmic-text = { package = "zgx-cosmic-text", version = "0.19.14", path = "../../vendor/cosmic-text" }
-arboard = { package = "zgx-arboard", version = "3.6.2", path = "../../vendor/arboard", default-features = false, features = ["image-data"] }
+arboard = { package = "zgx-arboard", version = "3.6.3", path = "../../vendor/arboard", default-features = false, features = ["image-data"] }
 accesskit = "0.24.1"
 # The adapters' (through accesskit_winit), named for its `links` metadata:
 # with the repository's (vendor/accesskit_consumer) a field's error message
@@ -166,6 +166,11 @@ zgx-script = { path = "../zgx-script", version = "0.1.10", optional = true }
 # On the main thread, where AppKit's menus are made (`fn main`).
 [[test]]
 name = "menu_services"
+harness = false
+
+# Quits processes of its own, each an app on the main thread.
+[[test]]
+name = "quit"
 harness = false
 
 # `ZGX_OFFSCREEN`, read once: a process of its own.

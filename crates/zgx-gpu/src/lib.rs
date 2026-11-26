@@ -8,7 +8,9 @@ use std::{cell::RefCell, fmt, rc::Rc, sync::Arc};
 use zgx::scene::{Color, NodeId, NodeKind, Rect, Scene};
 // Text shaping and measuring, in a crate of their own (zgx-text) that a host
 // with no renderer links alone; here as they always were.
-pub use zgx_text::{TextLook, TextServices, measure_text, prepared, set_text_look, text, text_look};
+pub use zgx_text::{
+    TextLook, TextServices, measure_text, prepared, set_text_look, text, text_look,
+};
 use zgx_text::{default_text_services, font_cache, install_text};
 
 mod bands;
@@ -17,7 +19,10 @@ mod compile;
 mod composition;
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
-pub use zgx_text::{core_text_advance, install_core_text_fallback};
+pub use zgx_text::{
+    core_text_advance, install_chrome_core_text_fallback, install_core_text_fallback,
+    rest_core_text_glyphs,
+};
 #[cfg(d3d11)]
 mod d3d11_frame;
 #[cfg(target_os = "linux")]
@@ -54,6 +59,10 @@ pub use layer_present::Caret;
 mod metal_frame;
 #[cfg(target_os = "macos")]
 mod native_surface;
+mod shader_check;
+pub use shader_check::{check_fill_shader, check_layer_shader};
+#[doc(hidden)]
+pub use shader_check::{check_fill_shader_whole, check_is_known, check_layer_shader_whole};
 #[cfg(target_os = "macos")]
 mod surfaces;
 #[cfg(target_os = "macos")]
@@ -291,6 +300,7 @@ pub struct GpuStats {
 }
 /// Retained allocation counters for diagnostics; excludes driver/font database allocations.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct DebugCacheStats {
     /// Text nodes whose shaping is cached.
     pub shaped_nodes: usize,
@@ -636,10 +646,128 @@ impl Interior {
             bounds.x >= band[0] && bounds.y >= band[1] && x1 <= band[2] && y1 <= band[3]
         })
     }
+    /// The larger part of `rect` in one of its bands, inward to whole device
+    /// pixels, if it has `PANEL_INTERIOR` at least (`split_fill`).
+    fn center(&self, rect: Rect, scale: f32) -> Option<Rect> {
+        let (x1, y1) = (rect.x + rect.width, rect.y + rect.height);
+        self.0
+            .iter()
+            .filter_map(|band| {
+                let left = (rect.x.max(band[0]) * scale).ceil() / scale;
+                let top = (rect.y.max(band[1]) * scale).ceil() / scale;
+                let right = (x1.min(band[2]) * scale).floor() / scale;
+                let bottom = (y1.min(band[3]) * scale).floor() / scale;
+                let (width, height) = (right - left, bottom - top);
+                (width > 0. && height > 0. && width * height >= PANEL_INTERIOR)
+                    .then(|| Rect::new(left, top, width, height))
+            })
+            .max_by(|a, b| (a.width * a.height).total_cmp(&(b.width * b.height)))
+    }
+}
+/// Whether `quad` fills its rectangle with one colour, and nothing else: no
+/// texture, corners, border, shadow, fade or transform (a `NodeKind::Rect`,
+/// or a panel's interior, `push_panel`). Drawn in pieces on whole device
+/// pixels, it covers the same pixels the same way.
+#[inline(always)]
+fn flat_fill(quad: &Quad) -> bool {
+    quad.options == [0.; 4]
+        && quad.shape == [0.; 4]
+        && quad.border == [0.; 4]
+        && quad.mask == NO_MASK
+        && quad.rect == quad.fade
+        && quad.rect[2] > 0.
+        && quad.rect[3] > 0.
+}
+/// Flat fill `quad` (`flat_fill`) reaching past its region's interior (a
+/// page's background to its rounded card's corners) in pieces: `center`, the
+/// part inside it, drawn without the region, so with the basic shader
+/// (`shading`) rather than the full one with the region at every pixel; and
+/// the bands around it, of the quad's own edges, in the region. Seams lie on
+/// whole device pixels (`Interior::center`). How many pieces it made.
+#[cold]
+#[inline(never)]
+fn split_fill(quads: &mut Vec<Quad>, at: usize, center: Rect, region: f32) -> usize {
+    let quad = quads[at];
+    let mut masked = quad;
+    masked.mask[0] = region;
+    let [x, y, width, height] = quad.rect;
+    let (right, bottom) = (x + width, y + height);
+    let (c_right, c_bottom) = (center.x + center.width, center.y + center.height);
+    let mut pieces = [quad; 5];
+    let mut count = 0;
+    for rect in [
+        [x, y, width, center.y - y],
+        [x, c_bottom, width, bottom - c_bottom],
+        [x, center.y, center.x - x, center.height],
+        [c_right, center.y, right - c_right, center.height],
+    ] {
+        if rect[2] > 0. && rect[3] > 0. {
+            pieces[count] = Quad {
+                rect,
+                fade: rect,
+                ..masked
+            };
+            count += 1;
+        }
+    }
+    let rect = [center.x, center.y, center.width, center.height];
+    pieces[count] = Quad {
+        rect,
+        fade: rect,
+        ..quad
+    };
+    count += 1;
+    quads.splice(at..=at, pieces[..count].iter().copied());
+    count
+}
+/// A box's draws (its quads from `start`, marked partly inside `region`'s
+/// interior by `mark_region`), its flat fills (`flat_fill`) in pieces
+/// (`split_fill`). Out of line, and the box's last step: an item in no region,
+/// or wholly inside one, pays nothing for it, nor for quads it may have added.
+#[cold]
+#[inline(never)]
+fn push_split_fills(
+    (draws, quads): (&mut Vec<Draw>, &mut Vec<Quad>),
+    (interiors, region): (&[Option<Interior>], f32),
+    start: u32,
+    (clip, bounds): (Rect, Rect),
+    polylines: bool,
+    scale: f32,
+) {
+    if let Some(Some(interior)) = interiors.get(region as usize - 1).copied() {
+        let mut at = start as usize;
+        while at < quads.len() {
+            let mut quad = quads[at];
+            // Marked in the region (`mask.x`): as it was before, for the pieces.
+            if quad.mask == [region, 0., 0., 0.] {
+                quad.mask = NO_MASK;
+                if flat_fill(&quad)
+                    && let Some(center) = interior.center(quad_rect(&quad), scale)
+                {
+                    quads[at] = quad;
+                    at += split_fill(quads, at, center, region);
+                    continue;
+                }
+            }
+            at += 1;
+        }
+    }
+    let draw = Draw {
+        shading: Shading::Full,
+        blur: None,
+        start,
+        end: quads.len() as u32,
+        clip,
+        bounds,
+        source: TextureSource::Atlas,
+    };
+    push_draw(draws, quads, draw, true, polylines, scale, None);
 }
 /// Marks `quads` as drawn in clip region `region` (`mask.x`), or without it
 /// where it changes none of their pixels (its index in `mask.w`): not in
-/// perspective, which `quad_rect` bounds only in part, nor blurred.
+/// perspective, which `quad_rect` bounds only in part, nor blurred. Whether
+/// each was marked by its own rectangle, the item lying partly inside: its
+/// flat fills may go in pieces (`push_split_fills`).
 #[inline(always)]
 fn mark_region(
     interiors: &mut Vec<Option<Interior>>,
@@ -649,7 +777,7 @@ fn mark_region(
     bounds: Rect,
     blurred: bool,
     scale: f32,
-) {
+) -> bool {
     let at = region as usize - 1;
     if interiors.len() <= at {
         interiors.resize(at + 1, None);
@@ -675,7 +803,9 @@ fn mark_region(
             };
             quad.mask[lane] = region;
         }
+        return true;
     }
+    false
 }
 /// `item`'s region's index (`region_index`). Under two fades (a faded label
 /// in a faded scroll) the outer one is a record of its own, which the
@@ -895,7 +1025,10 @@ impl QuadPipelines {
         self.subpixel
             .get_or_init(|| {
                 let device = &self.device;
-                if !device.features().contains(wgpu::Features::DUAL_SOURCE_BLENDING) {
+                if !device
+                    .features()
+                    .contains(wgpu::Features::DUAL_SOURCE_BLENDING)
+                {
                     return None;
                 }
                 let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1740,13 +1873,20 @@ const SUBPIXEL_GLYPH: f32 = 1.3;
 /// A glyph quad's `options.y` below `SHARP_TEXT_BELOW`: a mask whose coverage
 /// `draw.wgsl` firms by its colour (`firm`).
 const FIRM_GLYPH: f32 = 1.25;
+/// Whether a mask glyph's coverage is firmed at `scale` (`FIRM_GLYPH`):
+/// below `SHARP_TEXT_BELOW`, but not on macOS, whose font smoothing has
+/// thickened the glyph already (`text::smoothing`). The GPU's quads
+/// (`glyph_texture`) and the software raster (`glyph_coverage`) both ask.
+fn firms_glyphs(scale: f32) -> bool {
+    scale < SHARP_TEXT_BELOW && !cfg!(target_os = "macos")
+}
 /// A glyph's `options.y`: straight alpha, firmed below `SHARP_TEXT_BELOW` if a
 /// mask (a colour glyph's own colours stay as they are).
 fn glyph_texture(color: bool, subpixel: bool, scale: f32) -> f32 {
     if subpixel {
         return SUBPIXEL_GLYPH;
     }
-    if !color && (scale < SHARP_TEXT_BELOW || text_blend() != 0.) {
+    if !color && (firms_glyphs(scale) || text_blend() != 0.) {
         FIRM_GLYPH
     } else {
         1.
@@ -1786,8 +1926,12 @@ fn styled_glyphs<'a>(
                 glyph.physical((0., 0.), scale)
             };
             let run_index = style(run.line_i, glyph);
+            let key = p.cache_key;
+            // macOS: hinted at 1x only, as Core Text draws (`hinted_at`).
+            #[cfg(target_os = "macos")]
+            let key = text::hinted_at(key, scale);
             glyphs.push(Glyph {
-                key: p.cache_key,
+                key,
                 run: run_index,
                 x: p.x as f32,
                 // Each line's baseline on a whole device pixel too.
@@ -2123,6 +2267,15 @@ struct Shaped {
     quads: Vec<TextQuad>,
     /// Whether `quads` hold colour glyphs (`COLOR_GLYPH`).
     colored: bool,
+    /// How much its glyphs' keys are thickened (`text::smoothing`, macOS):
+    /// its colour's level, `PER_RUN` for rich text's (each glyph its run's),
+    /// none until keyed for its colours (`smooth_glyphs`).
+    #[cfg(target_os = "macos")]
+    smoothing: Option<u8>,
+    /// The colour plain text's `smoothing` was taken from: the same again,
+    /// and its level isn't worked out again each frame.
+    #[cfg(target_os = "macos")]
+    smoothed_for: Option<zgx::scene::Color>,
     atlas_epoch: u64,
     last_used: u64,
     /// The prepared text these glyphs were laid out from, kept while drawn.
@@ -2140,6 +2293,55 @@ impl Shaped {
             // as many shapes as when it held those.)
             + self.quads.capacity() * std::mem::size_of::<Quad>()
     }
+}
+/// `Shaped::smoothing` of rich text: each glyph's key thickened by its
+/// run's colour.
+#[cfg(target_os = "macos")]
+const PER_RUN: u8 = u8::MAX;
+/// Key `shaped`'s glyphs for macOS's font smoothing (`text::smoothing`) by
+/// its colour, `color`, or each rich run's, unless they are already: its
+/// quads then hold other glyphs, placed again from the new ones.
+#[cfg(target_os = "macos")]
+fn smooth_glyphs(shaped: &mut Shaped, color: zgx::scene::Color) {
+    if shaped.rich.is_none() && shaped.smoothing.is_some() && shaped.smoothed_for == Some(color) {
+        return;
+    }
+    let want = match shaped.rich {
+        Some(_) => PER_RUN,
+        None => text::smoothing(color),
+    };
+    if shaped.smoothing == Some(want) {
+        return;
+    }
+    match &shaped.rich {
+        Some(rich) => {
+            let runs = rich.runs();
+            // A run's level worked out once, not per glyph (a colour's
+            // luminance takes three powers): glyphs come run by run.
+            let mut last: Option<(usize, u8)> = None;
+            for glyph in &mut shaped.glyphs {
+                let level = match last {
+                    Some((run, level)) if run == glyph.run => level,
+                    _ => {
+                        let level = runs
+                            .get(glyph.run)
+                            .map_or(0, |run| text::smoothing(run.color));
+                        last = Some((glyph.run, level));
+                        level
+                    }
+                };
+                glyph.key = text::smoothed(glyph.key, level);
+            }
+        }
+        None => {
+            for glyph in &mut shaped.glyphs {
+                glyph.key = text::smoothed(glyph.key, want);
+            }
+        }
+    }
+    shaped.smoothing = Some(want);
+    shaped.smoothed_for = Some(color);
+    shaped.atlas_epoch = u64::MAX;
 }
 /// The atlas's key: cosmic-text's, losslessly, with its scalar fields
 /// packed into words so it hashes and compares in a few operations.
@@ -5325,6 +5527,10 @@ pub struct GpuRenderer {
     shaped_like: FxHashMap<u64, NodeId>,
     shaped_bytes: usize,
     fresh: bool,
+    /// `text::font_smoothing_epoch` its text was drawn at: another, and its
+    /// next frame draws all of it again (`text::set_font_smoothing`).
+    #[cfg(target_os = "macos")]
+    smoothing_epoch: u64,
     /// Consecutive presented frames whose damage covered the window.
     whole_frames: u32,
     /// The scene flush the retained target was last rendered from.
@@ -6180,6 +6386,8 @@ impl GpuRenderer {
             shaped_like: FxHashMap::default(),
             shaped_bytes: 0,
             fresh: true,
+            #[cfg(target_os = "macos")]
+            smoothing_epoch: text::font_smoothing_epoch(),
             whole_frames: 0,
             rendered_serial: None,
             copies: Vec::new(),
@@ -7094,6 +7302,23 @@ impl GpuRenderer {
             self.idle = false;
             if let Some(views) = &mut self.views {
                 views.owed = false;
+            }
+        }
+        // Text drawn thicker or lighter since (`text::set_font_smoothing`):
+        // every text's glyphs again, its layers' too. macOS only: elsewhere
+        // nothing of it is compiled, so `render` is as it was.
+        #[cfg(target_os = "macos")]
+        {
+            let smoothing = text::font_smoothing_epoch();
+            if smoothing != self.smoothing_epoch {
+                self.smoothing_epoch = smoothing;
+                // The level a colour keys to changed: each text's asked again.
+                for shaped in self.shapes.values_mut() {
+                    shaped.smoothed_for = None;
+                }
+                self.flush_pending();
+                self.layers.clear();
+                self.fresh = true;
             }
         }
         let presented = std::mem::take(&mut self.present_stats);
@@ -11187,6 +11412,10 @@ impl GpuRenderer {
                                     decoration.color = decoration.color_in(new);
                                 }
                                 shaped.rich = Some(new.clone());
+                                #[cfg(target_os = "macos")]
+                                {
+                                    shaped.smoothing = None;
+                                }
                                 shaped.atlas_epoch = self.atlas_epoch.wrapping_sub(1);
                             }
                             shaped.rich != rich
@@ -11233,8 +11462,11 @@ impl GpuRenderer {
                                 bounds.height.to_bits().hash(&mut hasher);
                                 hasher.finish()
                             });
-                            // (A twin's quads come with whether they hold colour glyphs.)
+                            // (A twin's quads come with whether they hold colour glyphs,
+                            // and its glyphs with how they are thickened.)
                             let mut twin_colored = false;
+                            #[cfg(target_os = "macos")]
+                            let mut twin_smoothing = (None, None);
                             let twin = content
                                 .and_then(|content| self.shaped_like.get(&content))
                                 .and_then(|id| self.shapes.get(id))
@@ -11250,6 +11482,10 @@ impl GpuRenderer {
                                 })
                                 .map(|twin| {
                                     spare_glyphs.extend_from_slice(&twin.glyphs);
+                                    #[cfg(target_os = "macos")]
+                                    {
+                                        twin_smoothing = (twin.smoothing, twin.smoothed_for);
+                                    }
                                     let placed = twin.atlas_epoch == self.atlas_epoch;
                                     if placed {
                                         spare_quads.extend_from_slice(&twin.quads);
@@ -11372,6 +11608,10 @@ impl GpuRenderer {
                                 glyphs,
                                 quads: spare_quads,
                                 colored: twin_colored,
+                                #[cfg(target_os = "macos")]
+                                smoothing: twin_smoothing.0,
+                                #[cfg(target_os = "macos")]
+                                smoothed_for: twin_smoothing.1,
                                 atlas_epoch: epoch.unwrap_or(0),
                                 last_used: self.frame,
                                 prepared,
@@ -11383,6 +11623,19 @@ impl GpuRenderer {
                                     self.shaped_like.clear();
                                 }
                                 insert_in::<MODE, _, _>(&mut self.shaped_like, content, item.id);
+                            }
+                        }
+                        // On macOS, its glyphs thickened as its colour has macOS's
+                        // own text thickened: a new colour, new glyphs. Compiled
+                        // only there, so elsewhere this function is as it was.
+                        #[cfg(target_os = "macos")]
+                        {
+                            let held = match fresh.as_mut() {
+                                Some(shaped) => Some(shaped),
+                                None => self.shapes.get_mut(&item.id),
+                            };
+                            if let Some(shaped) = held {
+                                smooth_glyphs(shaped, color);
                             }
                         }
                         let snap = |value: f32| (value * self.scale).round() / self.scale;
@@ -11822,9 +12075,32 @@ impl GpuRenderer {
                         let blurred = item.effects.blur_radius > 0.;
                         let item_quads = &mut quads[start as usize..];
                         let interiors = &mut self.region_interiors;
-                        mark_region(
+                        let partly = mark_region(
                             interiors, &clips, region, item_quads, drawn, blurred, self.scale,
                         );
+                        // A box with a flat fill past its region's interior
+                        // is drawn apart, its fill in pieces: nothing it does
+                        // comes back here, where every other item goes on as
+                        // if there were none. (Not a shader's fill.)
+                        if partly
+                            && self.split_shading
+                            && fill_shading.is_none()
+                            && canvas_image.is_none()
+                            && matches!(
+                                item.kind,
+                                NodeKind::Rect(_) | NodeKind::Quad(_) | NodeKind::Panel { .. }
+                            )
+                        {
+                            push_split_fills(
+                                (&mut draws, &mut quads),
+                                (&interiors[..], region),
+                                start,
+                                (draw_clip, drawn),
+                                polylines,
+                                self.scale,
+                            );
+                            continue;
+                        }
                     }
                     let draw = Draw {
                         shading: fill_shading.unwrap_or(Shading::Full),
@@ -11865,13 +12141,12 @@ impl GpuRenderer {
                     let run = &quads[draw.start as usize..draw.end as usize];
                     let unclipped = item.effects.edge_fade == 0.
                         && (!in_region || run.iter().all(|quad| quad.mask[0] <= 0.));
-                    let glyphs = glyphs_alone.then_some(
-                        match item.effects.edge_fade != 0. || in_region {
+                    let glyphs =
+                        glyphs_alone.then_some(match item.effects.edge_fade != 0. || in_region {
                             _ if unclipped && self.subpixel_glyphs(run) => Shading::Subpixel,
                             true => Shading::Full,
                             false => Shading::Basic,
-                        },
-                    );
+                        });
                     push_draw(
                         &mut draws, &quads, draw, split, polylines, self.scale, glyphs,
                     );
@@ -15882,6 +16157,7 @@ impl GpuRenderer {
             && self.entries.len() < 8192
             && (self.shelves.area() - self.unheld_area()) * 8
                 > u64::from(self.atlas_size).pow(2) * 3
+            && !self.levels_replaced()
         {
             let size = (self.atlas_size * 2).min(MAX_ATLAS);
             if !self.grow_atlas(size) {
@@ -15901,6 +16177,42 @@ impl GpuRenderer {
             .filter_map(|(_, entry)| *entry)
             .map(|e| u64::from(e.width + 2) * u64::from(e.height + 2))
             .sum()
+    }
+    /// macOS: whether most of the atlas's glyphs no text holds are those of
+    /// glyphs it does hold at another font smoothing level (a colour
+    /// animating through the levels, its text the same): given back, they
+    /// leave the room they took, as no new text would. Off macOS there are
+    /// no levels.
+    fn levels_replaced(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let level = |key: &AtlasKey| AtlasKey {
+                words: [
+                    key.words[0],
+                    key.words[1] & !cosmic_text::CacheKeyFlags::SMOOTHING.bits(),
+                    key.words[2],
+                    key.words[3],
+                ],
+                ..*key
+            };
+            let held = self.held_glyphs();
+            let held_unlevelled: FxHashSet<AtlasKey> = held.iter().map(level).collect();
+            let (mut unheld, mut replaced) = (0_u64, 0_u64);
+            for (key, entry) in &self.entries {
+                let Some(e) = entry else { continue };
+                if held.contains(key) {
+                    continue;
+                }
+                let texels = u64::from(e.width + 2) * u64::from(e.height + 2);
+                unheld += texels;
+                if held_unlevelled.contains(&level(key)) {
+                    replaced += texels;
+                }
+            }
+            replaced * 2 >= unheld && unheld > 0
+        }
+        #[cfg(not(target_os = "macos"))]
+        false
     }
     /// The glyphs of the text the renderer holds (`shapes`).
     fn held_glyphs(&self) -> FxHashSet<AtlasKey> {
@@ -17534,6 +17846,12 @@ impl GpuRenderer {
         frame: &wgpu::SurfaceTexture,
     ) -> Option<Option<wgpu::CommandBuffer>> {
         use ash::vk::{self, Handle as _};
+        // The image keeps what it held only with zgx's wgpu-hal patch
+        // (`Texture::presented`): wgpu's own takes it from undefined, which
+        // lets its pixels go.
+        if !cfg!(zgx_wgpu_hal_patched) {
+            return None;
+        }
         let size = self.target.size();
         let image = swap_image(&frame.texture)?;
         let rects = self.swap.lacks(image, (size.width, size.height))?;
@@ -17661,9 +17979,13 @@ impl GpuRenderer {
         for buffer in &buffers {
             encoder.clear_buffer(buffer, 0, None);
         }
+        #[cfg(zgx_wgpu_hal_patched)]
         let raw = buffers.each_ref().map(|buffer| {
             unsafe { buffer.as_hal::<wgpu::hal::api::Vulkan>() }.map(|b| unsafe { b.raw_handle() })
         });
+        // (Not reached: `copy_lacking` copies nothing without the patch.)
+        #[cfg(not(zgx_wgpu_hal_patched))]
+        let raw: [Option<vk::Buffer>; 2] = [None, None];
         let [Some(read_image), Some(read_target)] = raw else {
             return;
         };
@@ -17820,6 +18142,7 @@ impl GpuRenderer {
             self.swap.changed.clear();
             return;
         };
+        #[cfg(zgx_wgpu_hal_patched)]
         if let Some(surface) = &self.surface
             && let Some(hal) = unsafe { surface.as_hal::<wgpu::hal::api::Vulkan>() }
         {
@@ -18072,6 +18395,9 @@ impl GpuRenderer {
             fonts.shape_run_cache = Default::default();
             fonts.rest();
         }
+        // Core Text's fonts, and the glyphs it keeps with them.
+        #[cfg(target_os = "macos")]
+        zgx_text::rest_core_text_glyphs();
         self.text_cache
             .borrow_mut()
             .rest(self.shapes.values().filter_map(|shaped| shaped.prepared));
@@ -18089,13 +18415,14 @@ impl GpuRenderer {
     /// again as a new one, so the next frame pays nothing more for it. Nothing
     /// elsewhere.
     pub fn rest_queue(&mut self) {
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", zgx_wgpu_hal_patched))]
         self.renew_queue();
     }
     /// Metal's queue let go of, the driver's memory for it given back
     /// (`Queue::renew`), with all this renderer gave it finished and let go of
-    /// (a command buffer holds its queue).
-    #[cfg(target_os = "macos")]
+    /// (a command buffer holds its queue). Without zgx's wgpu-hal patch the
+    /// queue stays.
+    #[cfg(all(target_os = "macos", zgx_wgpu_hal_patched))]
     fn renew_queue(&mut self) {
         self.finish_direct();
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
@@ -19351,14 +19678,14 @@ pub(crate) fn single_use_module(
     label: &str,
     source: &str,
 ) -> wgpu::ShaderModule {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", zgx_wgpu_hal_patched))]
     wgpu::hal::metal::zgx_single_use_next_module(Some(source.to_owned()));
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(source.into()),
     });
     // (Taken back if wgpu made no module of it.)
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", zgx_wgpu_hal_patched))]
     wgpu::hal::metal::zgx_single_use_next_module(None);
     module
 }
@@ -19367,9 +19694,14 @@ pub(crate) fn single_use_module(
 /// shades a quad carrying uniforms (`mask.y`: their record in the region
 /// table, plus one) with `fill`'s colour and the rest as `shade` does.
 pub(crate) fn fill_source(user: &str) -> String {
+    fill_source_of(include_str!("draw.wgsl"), user)
+}
+/// [`fill_source`], `draw` the quad shader or what stands for it
+/// (`shader_check`).
+pub(crate) fn fill_source_of(draw: &str, user: &str) -> String {
     format!(
         "{}\nstruct FillInput {{ p:vec2<f32>, size:vec2<f32>, time:f32, scale:f32, params:array<vec4<f32>,4> }}\n{user}\n{}",
-        include_str!("draw.wgsl"),
+        draw,
         "@fragment fn zgx_fill(input:Out)->@location(0) vec4<f32> {
  if input.mask.y<.5 {return shade(input);}
  let u=regions[u32(input.mask.y)-1u]; var v=input;
@@ -19403,10 +19735,15 @@ fn layer_frame((rect, uv): (Rect, [f32; 4]), node: Rect) -> [f32; 4] {
 /// `layer` and shades the result as `shade` does. The quad's `fade` is the
 /// node's box and `point` its untransformed position, so `p` is the node's.
 pub(crate) fn filter_source(user: &str) -> String {
+    filter_source_of(include_str!("draw.wgsl"), include_str!("blend.wgsl"), user)
+}
+/// [`filter_source`], `draw` and `blend` the quad shader and blend.wgsl or
+/// what stands for them (`shader_check`).
+pub(crate) fn filter_source_of(draw: &str, blend: &str, user: &str) -> String {
     format!(
         "{}\n{}\nstruct LayerInput {{ color:vec4<f32>, p:vec2<f32>, size:vec2<f32>, time:f32, scale:f32, params:array<vec4<f32>,4>, radii:vec4<f32> }}\n{}\n{user}\n{}{}",
-        include_str!("draw.wgsl"),
-        include_str!("blend.wgsl"),
+        draw,
+        blend,
         "// The layer texture's coordinates at the node's top-left, and per point
 // (`layer_frame`).
 var<private> zgx_frame:vec4<f32>;
@@ -19598,42 +19935,6 @@ pub(crate) fn blend_source() -> String {
  return zgx_blend(shade(input),zgx_beneath(input.position),u32(input.mask.z));
 }"
     )
-}
-/// Checks a layer shader's source (the user's part) as the renderer will
-/// compile it, as `check_fill_shader` does a fill's.
-pub fn check_layer_shader(user: &str) -> Result<(), String> {
-    check_module(user, filter_source)
-}
-/// Checks a shader fill's source (the user's part, as `FillShader` holds
-/// it) as the renderer will compile it: `Err` reads like a compiler
-/// message, with lines counted in `user`, for an app or script to show.
-pub fn check_fill_shader(user: &str) -> Result<(), String> {
-    check_module(user, fill_source)
-}
-/// Checks `user` in the module `module` builds around it.
-fn check_module(user: &str, module: fn(&str) -> String) -> Result<(), String> {
-    let source = module(user);
-    // Lines before the user's code in the module `module` builds.
-    let template = module("\u{1}");
-    let before = template[..template.find('\u{1}').unwrap_or(0)]
-        .matches('\n')
-        .count();
-    let place = |location: Option<wgpu::naga::SourceLocation>| match location {
-        Some(at) if at.line_number as usize > before => {
-            format!("line {}: ", at.line_number as usize - before)
-        }
-        Some(_) => "in zgx's part of the module (a reserved name?): ".to_owned(),
-        None => String::new(),
-    };
-    let module = wgpu::naga::front::wgsl::parse_str(&source)
-        .map_err(|e| format!("{}{}", place(e.location(&source)), e.message()))?;
-    wgpu::naga::valid::Validator::new(
-        wgpu::naga::valid::ValidationFlags::all(),
-        wgpu::naga::valid::Capabilities::empty(),
-    )
-    .validate(&module)
-    .map(|_| ())
-    .map_err(|e| format!("{}{}", place(e.location(&source)), e.as_inner()))
 }
 /// Whether `source` (a shader fill's whole module) is valid WGSL.
 pub(crate) fn fill_validates(source: &str) -> bool {
@@ -21583,6 +21884,61 @@ pub fn plain_glyph_places(
         laid.key(),
     ))
 }
+/// `rich_glyph_places`: each glyph's key, pen position and run (for its
+/// colour), the decorations, and the prepared text's key when the prepared
+/// cache laid it out (for `trim_text`).
+#[doc(hidden)]
+pub type RichGlyphs = (
+    Vec<(CacheKey, f32, f32, usize)>,
+    Vec<text::RichDecoration>,
+    Option<u64>,
+);
+/// Rich text's glyphs as a renderer at `scale` places them: laid out as it
+/// lays them out (by `cache` where it prepares the text, else in a buffer of
+/// its own), each glyph's key, its pen position in device pixels from the
+/// text's origin and its run; then its decorations, in points from there.
+/// For the software raster, to draw rich text where and as the GPU does:
+/// laid out apart, in a font system of its own, its glyphs kept their
+/// fractions of a pixel and came out unlike the GPU's.
+#[doc(hidden)]
+pub fn rich_glyph_places(
+    fonts: &mut FontSystem,
+    cache: &mut prepared::TextCache,
+    rich: &zgx::rich_text::RichText,
+    wrap: f32,
+    height: f32,
+    scale: f32,
+) -> RichGlyphs {
+    let places = |glyphs: Vec<Glyph>| {
+        glyphs
+            .into_iter()
+            .map(|g| (g.key, g.x, g.y, g.run))
+            .collect()
+    };
+    if prepared::TextCache::handles(rich) {
+        let laid = cache.layout(fonts, rich, Some(wrap));
+        let starts = laid.line_starts();
+        let glyphs = glyphs_of(
+            Vec::new(),
+            laid.runs(Some(height)),
+            &starts,
+            Some(rich),
+            scale,
+        );
+        let decorations = text::rich_decorations_in(laid.runs(Some(height)), &starts, rich, fonts);
+        return (places(glyphs), decorations, Some(laid.key()));
+    }
+    let buffer = text::rich_buffer(fonts, rich, Some(wrap), Some(height));
+    let glyphs = glyphs_of(
+        Vec::new(),
+        buffer.layout_runs(),
+        &text::line_starts(&buffer),
+        Some(rich),
+        scale,
+    );
+    let decorations = text::rich_decorations(&buffer, rich, fonts);
+    (places(glyphs), decorations, None)
+}
 /// After a frame that laid text out from `fonts` and `cache` without a
 /// renderer (the software raster), what a renderer's frame trims: words
 /// unused a few shaping frames, and prepared text past what was `drawn`
@@ -21611,9 +21967,19 @@ pub fn glyph_image(
 /// `draw.wgsl`'s `skia`: coverage `a` of a grayscale glyph in `color` as
 /// Chromium's Skia blends it (`TextLook::Chromium`).
 fn skia_coverage(a: f32, color: Color) -> f32 {
-    let decode = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+    let decode = |v: f32| {
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
     let encode = |v: f32| {
-        if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.max(0.).powf(1. / 2.4) - 0.055 }
+        if v <= 0.0031308 {
+            v * 12.92
+        } else {
+            1.055 * v.max(0.).powf(1. / 2.4) - 0.055
+        }
     };
     let luma = (u32::from(color.0) * 54 + u32::from(color.1) * 183 + u32::from(color.2) * 19) >> 8;
     let base = (luma >> 5) << 5;
@@ -21660,7 +22026,7 @@ fn dwrite_coverage(a: f32, color: Color, blend: f32) -> f32 {
     c + c * (1. - c) * ((g[0] * f + g[1]) * c + (g[2] * f + g[3]))
 }
 /// A mask glyph's coverage `a` as `draw.wgsl` draws it in `color` at
-/// `scale`: firmed below `SHARP_TEXT_BELOW` (`firm`, `firmness`).
+/// `scale`: firmed where `firms_glyphs` says (`firm`, `firmness`).
 #[doc(hidden)]
 pub fn glyph_coverage(a: f32, color: Color, scale: f32) -> f32 {
     let blend = text_blend();
@@ -21670,7 +22036,7 @@ pub fn glyph_coverage(a: f32, color: Color, scale: f32) -> f32 {
     if blend < 0. {
         return skia_coverage(a, color);
     }
-    if scale >= SHARP_TEXT_BELOW {
+    if !firms_glyphs(scale) {
         return a;
     }
     let luma = (0.2126 * color.0 as f32 + 0.7152 * color.1 as f32 + 0.0722 * color.2 as f32) / 255.;
@@ -23460,6 +23826,10 @@ mod atlas_glyph_errors_tests {
                 .collect(),
             quads: Vec::new(),
             colored: false,
+            #[cfg(target_os = "macos")]
+            smoothing: None,
+            #[cfg(target_os = "macos")]
+            smoothed_for: None,
             atlas_epoch: 0,
             last_used: 0,
             prepared: None,
@@ -23868,7 +24238,10 @@ mod shader_compile_tests {
         let (mut gpu, mut scene) = renderer();
         let shader = green();
         filled(&mut scene, &shader);
+        // Still compiling as the frame is drawn, however fast it compiles.
+        let held = compile::held::hold();
         let (pixel, awaited) = frame(&mut gpu, &mut scene);
+        drop(held);
         assert_eq!(pixel, [255, 0, 0, 255], "the box's colour meanwhile");
         assert!(awaited, "a frame went without it");
         assert!(compiled(&gpu, &shader));
@@ -24880,5 +25253,27 @@ mod pixel_region_tests {
         );
         // Wholly off: nothing.
         assert_eq!(pixel_region(rect(-50., 0., 40., 40.), 2.).2, 0);
+    }
+}
+
+#[cfg(all(test, target_os = "macos", zgx_wgpu_hal_patched))]
+mod queue_rest_tests {
+    /// A window at rest lets Metal's queue go: what it draws with next is
+    /// another queue (the first held here, so its address isn't taken again).
+    #[test]
+    fn a_rested_renderers_queue_is_another() {
+        let mut gpu = crate::GpuRenderer::new(16, 16).expect("a renderer");
+        let raw = |gpu: &crate::GpuRenderer| {
+            // SAFETY: The queue's handle is kept, nothing is done with it.
+            unsafe { gpu.queue.as_hal::<wgpu::hal::api::Metal>() }
+                .expect("Metal's queue")
+                .as_raw()
+        };
+        let before = raw(&gpu);
+        let same = raw(&gpu);
+        assert!(std::ptr::eq(&*before, &*same), "unrested, the same queue");
+        gpu.rest_queue();
+        let after = raw(&gpu);
+        assert!(!std::ptr::eq(&*before, &*after), "rested, another queue");
     }
 }

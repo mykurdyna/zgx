@@ -4,6 +4,7 @@
 //! picked in them (`ui.read_file`, `ui.write_file`). A script reaches only
 //! files the user chose, as a web page does; reads and writes run off the
 //! main thread. A plugin gets none of it unless its host grants it.
+use crate::Str;
 use crate::{
     calls::{PromiseUd, pending, settle_failing, settle_with},
     value::Value,
@@ -132,7 +133,9 @@ fn listen(
                 continue;
             };
             vm.runtime.clone().batch(|| {
-                if let Err(e) = vm.call::<()>(&on_click, ()) {
+                if let Err(e) =
+                    vm.call_as::<()>("the notification's on_click handler", &on_click, ())
+                {
                     vm.report(e);
                 }
             });
@@ -156,10 +159,10 @@ pub(crate) fn file_value(path: &Path) -> Value {
         .map_or(0, |m| m.len());
     Value::Map(
         vec![
-            (Rc::from("name"), Value::Str(name.into())),
-            (Rc::from("path"), Value::Str(path.to_string_lossy().into())),
-            (Rc::from("size"), Value::Num(size as f64)),
-            (Rc::from("type"), Value::Str(media_type(path).into())),
+            (Str::from("name"), Value::Str(name.into())),
+            (Str::from("path"), Value::Str(path.to_string_lossy().into())),
+            (Str::from("size"), Value::Num(size as f64)),
+            (Str::from("type"), Value::Str(media_type(path).into())),
         ]
         .into(),
     )
@@ -402,8 +405,10 @@ pub(crate) fn install(
         let shared = shared.clone();
         board.set(
             "write",
-            // Text, or `{ text, html?, types? }`: HTML and types of the
-            // app's own beside the text, in one change of the clipboard.
+            // Text, or `{ text, html?, types?, image? }`: HTML and types of
+            // the app's own beside the text, in one change of the
+            // clipboard; with `image` (PNG bytes) too, a promise, as a
+            // platform pasting images decoded decodes it off the main thread.
             lua.create_function(move |lua, content: mlua::Value| {
                 if !clipboard {
                     return Err(denied("ui.clipboard.write", "Clipboard"));
@@ -415,11 +420,38 @@ pub(crate) fn install(
                         let text: String = table.get("text")?;
                         let html: Option<String> = table.get("html")?;
                         let types = clipboard_types(&table)?;
-                        zgx::widgets::ClipboardContent { text, html, types }
+                        let image: Option<mlua::LuaString> = table.get("image").map_err(|_| {
+                            mlua::Error::runtime("image is a PNG's bytes, a string")
+                        })?;
+                        match image {
+                            Some(png) => {
+                                let png: std::sync::Arc<[u8]> = png.as_bytes().as_ref().into();
+                                if !png.starts_with(b"\x89PNG\r\n\x1a\n") {
+                                    return Err(mlua::Error::runtime(
+                                        "ui.clipboard.write: image is a PNG's bytes",
+                                    ));
+                                }
+                                let promise = pending(lua, "clipboard.write".into())?;
+                                let shared = shared.clone();
+                                settle_with(lua, &promise, crate::errors::Kind::Io, async move {
+                                    let platform = later(&shared, "ui.clipboard.write")?;
+                                    let wrote = platform
+                                        .0
+                                        .set_clipboard_typed_image(text, html, &types, png)
+                                        .await;
+                                    Ok(Value::Bool(wrote))
+                                })?;
+                                return PromiseUd(promise).into_lua(lua);
+                            }
+                            None => zgx::widgets::ClipboardContent { text, html, types },
+                        }
                     }
-                    text => return Ok(platform.0.set_clipboard_text(String::from_lua(text, lua)?)),
+                    text => {
+                        let text = String::from_lua(text, lua)?;
+                        return platform.0.set_clipboard_text(text).into_lua(lua);
+                    }
                 };
-                Ok(content.write(&*platform.0))
+                content.write(&*platform.0).into_lua(lua)
             })?,
         )?;
     }
@@ -818,13 +850,23 @@ fn download_status(
     Ok(move |status: DownloadStatus| {
         let Some(vm) = vm.upgrade() else { return };
         let result = match status {
-            DownloadStatus::Progress { received, total } => progress
+            DownloadStatus::Progress { received, total } => progress.as_ref().map(|f| {
+                vm.call_as::<()>(
+                    "the download's on_progress handler",
+                    f,
+                    (received as f64, total.map(|t| t as f64)),
+                )
+            }),
+            DownloadStatus::Finished => finish.as_ref().map(|f| {
+                vm.call_as::<()>(
+                    "the download's on_done handler",
+                    f,
+                    (true, mlua::Value::Nil),
+                )
+            }),
+            DownloadStatus::Failed(why) => finish
                 .as_ref()
-                .map(|f| vm.call::<()>(f, (received as f64, total.map(|t| t as f64)))),
-            DownloadStatus::Finished => finish
-                .as_ref()
-                .map(|f| vm.call::<()>(f, (true, mlua::Value::Nil))),
-            DownloadStatus::Failed(why) => finish.as_ref().map(|f| vm.call::<()>(f, (false, why))),
+                .map(|f| vm.call_as::<()>("the download's on_done handler", f, (false, why))),
             _ => None,
         };
         if let Some(Err(e)) = result {

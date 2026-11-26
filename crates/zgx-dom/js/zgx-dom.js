@@ -90,6 +90,7 @@ export function zgx_init(baseCss, onDispatch, onFlush, onEvent, onKeys) {
   document.addEventListener("compositionstart", onCompositionStart, true);
   document.addEventListener("compositionend", onCompositionEnd, true);
   document.addEventListener("keydown", onEditKey, true);
+  document.addEventListener("selectionchange", onEditSelection);
 }
 
 // A link with no href (`role=link`): Enter presses it, as it does a link.
@@ -1777,6 +1778,32 @@ export function zgx_measure(font, text) {
   return new Float64Array([m.width, m.fontBoundingBoxAscent + m.fontBoundingBoxDescent]);
 }
 
+// Text measured as the page lays it out, nothing of it shown: one hidden
+// box kept off the page, its font, spacing and features set each time, as
+// wide as the text up to `width` (wrapping there; -1 for none). Width and
+// height in CSS pixels.
+let textBox = null;
+export function zgx_measure_text(font, text, width, lineHeight, letterSpacing, features) {
+  if (!textBox) {
+    textBox = document.createElement("div");
+    textBox.setAttribute("aria-hidden", "true");
+    textBox.style.cssText = "position:absolute;left:-100000px;top:0;visibility:hidden;contain:layout style;pointer-events:none";
+    document.body.appendChild(textBox);
+  }
+  const s = textBox.style;
+  s.font = font;
+  s.lineHeight = lineHeight > 0 ? lineHeight + "px" : "normal";
+  s.letterSpacing = letterSpacing ? letterSpacing + "px" : "normal";
+  s.fontFeatureSettings = features || "normal";
+  s.whiteSpace = width >= 0 ? "pre-wrap" : "pre";
+  s.overflowWrap = width >= 0 ? "anywhere" : "normal";
+  s.width = "max-content";
+  s.maxWidth = width >= 0 ? width + "px" : "none";
+  textBox.textContent = text;
+  const r = textBox.getBoundingClientRect();
+  return new Float64Array([r.width, r.height]);
+}
+
 // A secondary click: the nearest element with a context menu (a span's own
 // before its paragraph's) builds its entries, told where and the span it
 // was on; one that opens a menu prevents the browser's.
@@ -1845,6 +1872,24 @@ export function zgx_clipboard_write_typed(text, html, types) {
   typedCopy = null;
   if (!taken) return zgx_clipboard_write(text, html);
   clipboard = { text, html: html === undefined ? null : html, types: pairs };
+  return true;
+}
+
+// `text`, `html` and `png` (an encoded PNG's bytes) as one ClipboardItem:
+// the async Clipboard API's image/png beside text/plain and text/html. A
+// page's own types can't go with an image (a copy event's data takes no
+// image), so a write with both takes the image. Refused (no permission, the
+// page not focused): what was asked stays what this page reads.
+export function zgx_clipboard_write_image(text, html, png) {
+  clipboard = { text, html: html === undefined ? null : html, types: [] };
+  const c = navigator.clipboard;
+  if (!c || typeof ClipboardItem === "undefined") return false;
+  const item = {
+    "text/plain": new Blob([text], { type: "text/plain" }),
+    "image/png": new Blob([png], { type: "image/png" }),
+  };
+  if (html != null) item["text/html"] = new Blob([html], { type: "text/html" });
+  c.write([new ClipboardItem(item)]).catch(() => {});
   return true;
 }
 
@@ -1928,6 +1973,48 @@ function pointAt(el, at) {
   return [el, el.childNodes.length];
 }
 
+// The chip (an atom of a text area over a model) `node`, a point of a
+// selection, is inside, if any.
+function chipOf(node) {
+  for (let at = node; at; at = at.parentNode) {
+    if (at.nodeType === 1 && at.hasAttribute("data-atom")) return at;
+    if (at.$$e !== undefined) return null;
+  }
+  return null;
+}
+
+// A selection with an end inside a chip, as the model has it: a caret at
+// the chip's nearer edge, a selection taking the chip whole (the browser
+// leaves a point inside one where it was put there, or dragged there).
+function onEditSelection() {
+  const selection = document.getSelection();
+  if (!selection || selection.rangeCount === 0) return;
+  const { anchorNode, anchorOffset, focusNode, focusOffset } = selection;
+  const anchorChip = chipOf(anchorNode);
+  const focusChip = chipOf(focusNode);
+  if (!anchorChip && !focusChip) return;
+  const el = editHost(anchorChip || focusChip);
+  if (!el) return;
+  const at = (node, offset) => textOffset(el, node, offset);
+  const edges = (chip) => {
+    const start = at(chip.parentNode, Array.prototype.indexOf.call(chip.parentNode.childNodes, chip));
+    return [start, start + chip.textContent.length];
+  };
+  let anchor = at(anchorNode, anchorOffset);
+  let focus = at(focusNode, focusOffset);
+  if (anchor === focus) {
+    const [start, end] = edges(anchorChip || focusChip);
+    anchor = focus = anchor - start < end - anchor ? start : end;
+  } else {
+    const forward = anchor < focus;
+    if (anchorChip) anchor = edges(anchorChip)[forward ? 0 : 1];
+    if (focusChip) focus = edges(focusChip)[forward ? 1 : 0];
+  }
+  const [aNode, aOffset] = pointAt(el, anchor);
+  const [fNode, fOffset] = pointAt(el, focus);
+  selection.setBaseAndExtent(aNode, aOffset, fNode, fOffset);
+}
+
 // `el`'s selection set from its model's (UTF-16 units), while it has the focus.
 function selectIn(el, anchor, focus) {
   const active = document.activeElement;
@@ -1988,9 +2075,17 @@ function onBeforeInput(event) {
   const text = el.textContent;
   const [start, end] = editRange(el, event);
   let data = event.data;
-  // A paste or a drop: its plain text alone.
-  if (data == null && event.dataTransfer) data = event.dataTransfer.getData("text/plain");
-  sendEdit(el, event.inputType, data || "", utf8(text, start), utf8(text, end));
+  let kind = event.inputType;
+  // A paste or a drop: its plain text, and a copy's atoms beside it.
+  if (data == null && event.dataTransfer) {
+    data = event.dataTransfer.getData("text/plain");
+    const atoms = kind === "insertFromPaste" ? event.dataTransfer.getData(ATOMS_TYPE) : "";
+    if (atoms) {
+      kind = "insertFromPasteAtoms";
+      data = (data || "") + "\0" + atoms;
+    }
+  }
+  sendEdit(el, kind, data || "", utf8(text, start), utf8(text, end));
 }
 
 function onCompositionStart(event) {
@@ -2062,6 +2157,18 @@ export function zgx_focus_snapshot() {
   return el.selectionDirection === "backward" ? [id, tag, end, start] : [id, tag, start, end];
 }
 
+// A text area over a model's selection in the page, as UTF-8 bytes of its
+// text (anchor, focus in order), for an edit a script makes there at the
+// caret; undefined where the selection is elsewhere.
+export function zgx_edit_selection(id) {
+  const el = nodes[id];
+  const selection = document.getSelection();
+  if (!el || !selection || selection.rangeCount === 0 || !el.contains(selection.anchorNode)) return undefined;
+  const text = el.textContent;
+  const [start, end] = editSelection(el);
+  return [utf8(text, start), utf8(text, end)];
+}
+
 // `NodeHandle::restore_focus`: focus back on the snapshot's node, its
 // selection set, nothing scrolled (no container around it, the page or the
 // field's own text). False, and nothing changed, if the node is gone or its
@@ -2131,6 +2238,46 @@ export function zgx_open_url(url) {
   return window.open(url, "_blank", "noopener,noreferrer") !== null || true;
 }
 
+// A text area's atoms on the clipboard beside its text (`ATOMS_TYPE` in
+// zgx): what its model hands a copy (`zgx_copy_atoms`).
+const ATOMS_TYPE = "application/x-zgx-atoms";
+let atomsCopy = null;
+
+export function zgx_copy_atoms(text, atoms) {
+  atomsCopy = { text, atoms: atoms === undefined ? null : atoms };
+}
+
+// A copy or a cut out of a text area over a model (one with atoms): its
+// model's text and atoms, the cut taken out of the model as an edit.
+function copyFromModel(event) {
+  const selection = document.getSelection();
+  if (!selection || selection.rangeCount === 0 || selection.isCollapsed) return false;
+  const el = editHost(selection.anchorNode);
+  if (!el || !el.contains(selection.focusNode) || !event.clipboardData) return false;
+  const text = el.textContent;
+  const [start, end] = editSelection(el);
+  atomsCopy = null;
+  sendEdit(el, "copy", "", utf8(text, start), utf8(text, end));
+  const copy = atomsCopy;
+  atomsCopy = null;
+  if (!copy) return false;
+  const data = event.clipboardData;
+  data.setData("text/plain", copy.text);
+  const types = [];
+  if (copy.atoms !== null) {
+    data.setData(ATOMS_TYPE, copy.atoms);
+    types.push([ATOMS_TYPE, copy.atoms]);
+  }
+  clipboard = { text: copy.text, html: null, types };
+  event.preventDefault();
+  if (event.type === "cut") {
+    const now = el.textContent;
+    const [from, to] = editSelection(el);
+    sendEdit(el, "deleteByCut", "", utf8(now, from), utf8(now, to));
+  }
+  return true;
+}
+
 function onCopy(event) {
   // A copy `zgx_clipboard_write_typed` made: what it writes, nothing else.
   if (typedCopy && event.clipboardData) {
@@ -2143,6 +2290,7 @@ function onCopy(event) {
     event.stopImmediatePropagation();
     return;
   }
+  if (copyFromModel(event)) return;
   const selection = document.getSelection();
   const text = selection ? selection.toString() : "";
   if (text) clipboard = { text, html: null, types: [] };

@@ -186,7 +186,16 @@ pub(super) struct WordCache {
     fonts: Vec<(Font, AttrsList)>,
     shapes: FxHashMap<u64, (u32, Box<str>, Arc<Shape>)>,
     bytes: usize,
+    /// The room a long paragraph's word ranges took, kept for the next
+    /// (`words`).
+    ranges: Ranges,
 }
+
+/// A paragraph's words' byte ranges, each with whether it is blank.
+type Ranges = smallvec::SmallVec<[(usize, usize, bool); 16]>;
+/// The room `WordCache::ranges` keeps past a sweep: a long paragraph's (a
+/// thousand words and their blanks), 48 KB.
+const RANGES_KEPT: usize = 2048;
 
 /// Whether text in `font` can be laid out from its words: its attributes
 /// are one span (no fallback families), and nothing changes its glyphs
@@ -216,6 +225,9 @@ impl WordCache {
             .sum();
         if self.shapes.capacity() > 2 * self.shapes.len() + 64 {
             self.shapes.shrink_to_fit();
+        }
+        if self.ranges.capacity() > RANGES_KEPT {
+            self.ranges = Ranges::new();
         }
     }
     /// How many words it holds.
@@ -275,7 +287,20 @@ impl WordCache {
         }
         let size = font_size.max(1.);
         let ids: smallvec::SmallVec<[u32; 4]> = runs.iter().map(|run| self.font(run)).collect();
-        let mut ranges: smallvec::SmallVec<[(usize, usize, bool); 16]> = smallvec::SmallVec::new();
+        // A long paragraph's ranges in the room the last one left (`ranges`),
+        // at least a word and its blank every six bytes: grown by doubling
+        // afresh, each growth copied them, a fifth of mounting a page of
+        // text. A short paragraph's stay inline, as they were.
+        let long = text.len() > 96;
+        let mut ranges = match long {
+            true => {
+                let mut kept = std::mem::take(&mut self.ranges);
+                kept.clear();
+                kept.reserve(text.len() / 3);
+                kept
+            }
+            false => Ranges::new(),
+        };
         // (`plain_line` was asked first: `TextCache::words_of`.) Read from
         // where the words it grew from stop holding.
         let (grew, taken) = match grew {
@@ -326,7 +351,7 @@ impl WordCache {
         words.truncate(taken);
         words.reserve(ranges.len());
         let mut run = 0;
-        for (start, end, blank) in ranges {
+        for (start, end, blank) in ranges.drain(..) {
             while runs[run].end <= start {
                 run += 1;
             }
@@ -395,6 +420,9 @@ impl WordCache {
                 }
                 false => stream.measured.clear(),
             }
+        }
+        if long {
+            self.ranges = ranges;
         }
         kept.font_size = size;
         kept.align = align;
@@ -725,14 +753,7 @@ impl Words {
         line.add(fitting, (words.len(), 0), range_width, range_height);
         line.push(&mut sums, &mut any, line_height);
         let height = sums.height + if any { 0. } else { line_height };
-        let reach = match width {
-            Some(_) if sums.fit <= sums.widest && sums.beyond.is_finite() => {
-                let reach = sums.beyond - 1e-3;
-                reach - reach.abs() * 1e-6 - 1e-6
-            }
-            Some(_) if sums.fit <= sums.widest => f32::INFINITY,
-            _ => 0.,
-        };
+        let reach = super::wrap_reach(width, sums.fit, sums.widest, sums.beyond);
         let size = ((sums.widest, height), reach);
         if stream.measured.len() == MEASURED {
             stream.measured.remove(0);

@@ -35,11 +35,22 @@ extern "C" {
         html: Option<String>,
         types: Vec<String>,
     ) -> bool;
+    pub(crate) fn zgx_clipboard_write_image(text: &str, html: Option<String>, png: &[u8]) -> bool;
     pub(crate) fn zgx_clipboard_types() -> Vec<String>;
     pub(crate) fn zgx_clipboard_typed(mime: &str) -> Option<String>;
+    pub(crate) fn zgx_copy_atoms(text: &str, atoms: Option<&str>);
+    pub(crate) fn zgx_edit_selection(id: u32) -> Option<Box<[f64]>>;
     pub(crate) fn zgx_open_url(url: &str) -> bool;
     pub(crate) fn zgx_scroll_into_view(id: u32, block: &str, inline: &str, animate: i32) -> bool;
     pub(crate) fn zgx_measure(font: &str, text: &str) -> Box<[f64]>;
+    pub(crate) fn zgx_measure_text(
+        font: &str,
+        text: &str,
+        width: f64,
+        line_height: f64,
+        letter_spacing: f64,
+        features: &str,
+    ) -> Box<[f64]>;
     pub(crate) fn zgx_focus_snapshot() -> Option<Box<[f64]>>;
     pub(crate) fn zgx_restore_focus(id: u32, tag: u32, anchor: f64, focus: f64) -> bool;
 }

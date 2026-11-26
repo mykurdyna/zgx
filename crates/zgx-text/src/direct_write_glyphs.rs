@@ -101,7 +101,8 @@ fn read_params() -> Option<Params> {
         // SAFETY: the parameters are a COM object owned here; the
         // smoothing type is written into a local.
         unsafe {
-            let params: IDWriteRenderingParams1 = writer.factory.CreateRenderingParams().ok()?.cast().ok()?;
+            let params: IDWriteRenderingParams1 =
+                writer.factory.CreateRenderingParams().ok()?.cast().ok()?;
             let mut smoothing = 0u32;
             let read = SystemParametersInfoW(
                 SPI_GETFONTSMOOTHINGTYPE,
@@ -179,7 +180,8 @@ fn face_for(
             for axis in &mut axes {
                 if axis.axisTag == DWRITE_FONT_AXIS_TAG_WEIGHT {
                     axis.value = f32::from(key.font_weight.0);
-                } else if axis.axisTag == DWRITE_FONT_AXIS_TAG_OPTICAL_SIZE && key.font_optical > 0 {
+                } else if axis.axisTag == DWRITE_FONT_AXIS_TAG_OPTICAL_SIZE && key.font_optical > 0
+                {
                     axis.value = f32::from(key.font_optical);
                 }
             }
@@ -198,7 +200,11 @@ fn face_for(
 
 /// Face `id`'s font resource, from its bytes (copied by DirectWrite), with
 /// its `gasp` ranges and whether it is hinted.
-fn resource_for(writer: &Writer, fonts: &mut FontSystem, id: cosmic_text::fontdb::ID) -> Option<Source> {
+fn resource_for(
+    writer: &Writer,
+    fonts: &mut FontSystem,
+    id: cosmic_text::fontdb::ID,
+) -> Option<Source> {
     let index = fonts.db().face(id)?.index;
     let font = fonts.get_font(id, cosmic_text::fontdb::Weight::NORMAL)?;
     let data = font.data();
@@ -216,14 +222,22 @@ fn resource_for(writer: &Writer, fonts: &mut FontSystem, id: cosmic_text::fontdb
             )
             .ok()?;
         let resource = writer.factory.CreateFontResource(&file, index).ok()?;
-        Some(Source { resource, gasp, hinted })
+        Some(Source {
+            resource,
+            gasp,
+            hinted,
+        })
     }
 }
 
 /// `font`'s `gasp` ranges, version 1 or later.
 fn gasp(font: &cosmic_text::Font) -> Option<Vec<(u16, u16)>> {
     let table = font.as_swash().table(u32::from_be_bytes(*b"gasp"))?;
-    let at = |i: usize| table.get(i..i + 2).map(|b| u16::from_be_bytes([b[0], b[1]]));
+    let at = |i: usize| {
+        table
+            .get(i..i + 2)
+            .map(|b| u16::from_be_bytes([b[0], b[1]]))
+    };
     if at(0)? < 1 {
         return None;
     }
@@ -249,7 +263,9 @@ fn chromium_mode(source: &Source, ppem: f32) -> (DWRITE_RENDERING_MODE1, f32) {
     const SYMMETRIC_SMOOTHING: u16 = 0x0008;
     let gdi = ((ppem * 64.).round() / 64.).max(1.);
     if let Some(ranges) = &source.gasp
-        && let Some(&(_, flags)) = ranges.iter().find(|&&(max, _)| (gdi.round() as i32) <= i32::from(max))
+        && let Some(&(_, flags)) = ranges
+            .iter()
+            .find(|&&(max, _)| (gdi.round() as i32) <= i32::from(max))
     {
         let mode = if flags & SYMMETRIC_SMOOTHING != 0 {
             DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC
@@ -266,12 +282,17 @@ fn chromium_mode(source: &Source, ppem: f32) -> (DWRITE_RENDERING_MODE1, f32) {
 }
 
 /// `key`'s glyph of `face`, as a coverage mask placed from its pen position.
-fn draw(writer: &Writer, face: &IDWriteFontFace5, source: &Source, key: CacheKey) -> Option<SwashImage> {
+fn draw(
+    writer: &Writer,
+    face: &IDWriteFontFace5,
+    source: &Source,
+    key: CacheKey,
+) -> Option<SwashImage> {
     let size = f32::from_bits(key.font_size_bits);
     let chromium = crate::text_look() == crate::TextLook::Chromium;
     let (chromium_mode, em) = chromium_mode(source, size);
     let size = if chromium { em } else { size };
-    let glyph = u16::try_from(key.glyph_id).ok()?;
+    let glyph = key.glyph_id;
     let advance = 0f32;
     let offset = DWRITE_GLYPH_OFFSET::default();
     let face0: IDWriteFontFace = face.cast().ok()?;
@@ -308,7 +329,10 @@ fn draw(writer: &Writer, face: &IDWriteFontFace5, source: &Source, key: CacheKey
             &mut mode,
             &mut grid,
         );
-        if recommended.is_err() || mode == DWRITE_RENDERING_MODE1_OUTLINE || mode == DWRITE_RENDERING_MODE1_ALIASED {
+        if recommended.is_err()
+            || mode == DWRITE_RENDERING_MODE1_OUTLINE
+            || mode == DWRITE_RENDERING_MODE1_ALIASED
+        {
             mode = DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC;
         }
         // Chromium's: Skia's mode, grid fitting on (its hinting is
@@ -326,7 +350,9 @@ fn draw(writer: &Writer, face: &IDWriteFontFace5, source: &Source, key: CacheKey
             key.x_bin.as_float(),
             key.y_bin.as_float(),
         );
-        analysis.ok().and_then(|analysis| mask(&analysis, cleartype || chromium, cleartype))
+        analysis
+            .ok()
+            .and_then(|analysis| mask(&analysis, cleartype || chromium, cleartype))
     };
     drop(std::mem::ManuallyDrop::into_inner(run.fontFace));
     image
@@ -342,7 +368,11 @@ fn draw(writer: &Writer, face: &IDWriteFontFace5, source: &Source, key: CacheKey
 ///
 /// # Safety
 /// `analysis` is a live glyph run analysis.
-unsafe fn mask(analysis: &IDWriteGlyphRunAnalysis, three: bool, subpixels: bool) -> Option<SwashImage> {
+unsafe fn mask(
+    analysis: &IDWriteGlyphRunAnalysis,
+    three: bool,
+    subpixels: bool,
+) -> Option<SwashImage> {
     let cleartype = three;
     let kind = if cleartype {
         DWRITE_TEXTURE_CLEARTYPE_3x1
@@ -378,7 +408,11 @@ unsafe fn mask(analysis: &IDWriteGlyphRunAnalysis, three: bool, subpixels: bool)
             image.data = data
                 .chunks_exact(3)
                 .flat_map(|rgb| {
-                    let [r, g, b] = if bgr { [rgb[2], rgb[1], rgb[0]] } else { [rgb[0], rgb[1], rgb[2]] };
+                    let [r, g, b] = if bgr {
+                        [rgb[2], rgb[1], rgb[0]]
+                    } else {
+                        [rgb[0], rgb[1], rgb[2]]
+                    };
                     let mean = ((u16::from(r) + u16::from(g) + u16::from(b) + 1) / 3) as u8;
                     [r, g, b, mean]
                 })
@@ -403,7 +437,12 @@ mod tests {
         let mut fonts = FontSystem::new();
         let mut swash = SwashCache::new();
         let mut buffer = Buffer::new(&mut fonts, Metrics::new(13., 18.));
-        buffer.set_text("Hamburgefonstiv", &Attrs::new().family(Family::SansSerif), Shaping::Advanced, None);
+        buffer.set_text(
+            "Hamburgefonstiv",
+            &Attrs::new().family(Family::SansSerif),
+            Shaping::Advanced,
+            None,
+        );
         buffer.shape_until_scroll(&mut fonts, false);
         let mut checked = 0;
         for run in buffer.layout_runs() {
@@ -419,14 +458,27 @@ mod tests {
                     continue;
                 }
                 let ink = |image: &cosmic_text::SwashImage| match image.content {
-                    cosmic_text::SwashContent::SubpixelMask => {
-                        image.data.chunks_exact(4).map(|p| u32::from(p[3])).sum::<u32>() as f32
-                    }
+                    cosmic_text::SwashContent::SubpixelMask => image
+                        .data
+                        .chunks_exact(4)
+                        .map(|p| u32::from(p[3]))
+                        .sum::<u32>()
+                        as f32,
                     _ => image.data.iter().map(|&a| u32::from(a)).sum::<u32>() as f32,
                 };
                 let (a, b) = (ink(&ours), ink(&theirs));
-                assert!((ours.placement.left - theirs.placement.left).abs() <= 2, "left {:?} {:?}", ours.placement, theirs.placement);
-                assert!((ours.placement.top - theirs.placement.top).abs() <= 2, "top {:?} {:?}", ours.placement, theirs.placement);
+                assert!(
+                    (ours.placement.left - theirs.placement.left).abs() <= 2,
+                    "left {:?} {:?}",
+                    ours.placement,
+                    theirs.placement
+                );
+                assert!(
+                    (ours.placement.top - theirs.placement.top).abs() <= 2,
+                    "top {:?} {:?}",
+                    ours.placement,
+                    theirs.placement
+                );
                 assert!((a / b - 1.).abs() < 0.35, "ink {a} against {b}");
                 checked += 1;
             }

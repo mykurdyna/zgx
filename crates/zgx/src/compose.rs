@@ -550,6 +550,10 @@ type AtomsFollow = Box<dyn FnMut(&mut crate::text_edit::TextEditor) -> Vec<crate
 #[derive(Default)]
 pub(crate) struct CodeOptions {
     highlighter: Option<crate::widgets::SpanHighlighter>,
+    /// `line_insets`: each line's room (`EditorHandle::set_line_insets`).
+    line_insets: Option<crate::widgets::LineInsets>,
+    /// `line_marks`: each line's marks (`EditorHandle::set_line_marks`).
+    line_marks: Option<crate::widgets::LineMarks>,
     decorations: Option<Box<dyn FnMut() -> Decorations>>,
     underlines: Option<Box<dyn FnMut() -> Underlines>>,
     current_line: Option<Box<dyn FnMut() -> Option<crate::scene::Color>>>,
@@ -563,6 +567,10 @@ pub(crate) struct CodeOptions {
     atom_pointer: Option<Rc<crate::editor_atom_pointer::AtomPointer>>,
     /// `atom_style`: how its atoms show beyond a wash.
     atom_style: Option<crate::editor_atom_style::AtomStyle>,
+    /// `atom_codec`: how its atoms go on the clipboard beyond the app.
+    atom_codec: Option<crate::widgets::AtomCodec>,
+    /// `group_scrollbar`: its scroll groups' scrollbar.
+    group_scrollbar: bool,
 }
 /// `View`'s fields few views set (`View::rare`).
 #[derive(Default)]
@@ -598,6 +606,8 @@ pub(crate) struct Rare {
     /// `View::active_descendant`: the id of the item it is on.
     active_descendant: Option<Box<dyn Fn() -> Option<String>>>,
     dismiss_backdrop: Option<bool>,
+    /// `View::on_dismiss`: runs as the person closes a modal or popover.
+    on_dismiss: Option<Rc<dyn Fn()>>,
     /// Where an overlay opens and a submenu's own trigger row: boxed, as
     /// few views have them (views are moved through the mount recursion).
     portal: Option<Box<PortalOptions>>,
@@ -694,6 +704,7 @@ impl Rare {
             && code.on_atoms.is_none()
             && code.atom_wash.is_none()
             && code.atom_style.is_none()
+            && code.atom_codec.is_none()
         {
             return None;
         }
@@ -702,6 +713,7 @@ impl Rare {
             on_atoms: code.on_atoms.take(),
             wash: code.atom_wash.take(),
             style: code.atom_style.take(),
+            codec: code.atom_codec.take(),
         }))
     }
     /// `View::refine`'s part: what an outer view sets over its inner one.
@@ -711,6 +723,9 @@ impl Rare {
         }
         if self.dismiss_backdrop.is_some() {
             inner.dismiss_backdrop = self.dismiss_backdrop;
+        }
+        if self.on_dismiss.is_some() {
+            inner.on_dismiss = self.on_dismiss;
         }
         if self.portal.is_some() {
             inner.portal = self.portal;
@@ -1053,7 +1068,8 @@ impl View {
         self.edges_mut().ancestor = true;
         self
     }
-    /// Show an interactive overlay scrollbar on a scroll viewport or virtual list.
+    /// Show an interactive overlay scrollbar on a scroll viewport, virtual list or text area (at its box's edge,
+    /// over its padding: it takes no room from the text).
     pub fn scrollbar(mut self, visible: bool) -> Self {
         self.rare_mut().scrollbar = Some(visible);
         self
@@ -1157,6 +1173,15 @@ impl View {
     /// Configure whether clicking outside a modal or popover panel dismisses it.
     pub fn dismiss_on_backdrop(mut self, enabled: bool) -> Self {
         self.rare_mut().dismiss_backdrop = Some(enabled);
+        self
+    }
+    /// Runs as the person closes a modal (Escape, or a press on the
+    /// backdrop), after it has closed: for what a closing owes the app when
+    /// its `open` is a plain signal the app also sets. Any other view ignores
+    /// it (a debug build says so, once).
+    #[doc(hidden)]
+    pub fn on_dismiss(mut self, handler: impl Fn() + 'static) -> Self {
+        self.rare_mut().on_dismiss = Some(Rc::new(handler));
         self
     }
     /// Where an anchored popover or menu opens against its trigger (below
@@ -2029,6 +2054,38 @@ impl View {
         self.code_mut().highlighter = Some(std::rc::Rc::new(highlighter));
         self
     }
+    /// Room around each line of a text area (a list item's indent, a
+    /// heading's space above; `EditorHandle::set_line_insets`), given the
+    /// line's index, its text and what the line before left its
+    /// highlighter. It must depend on nothing but its arguments.
+    #[doc(hidden)]
+    pub fn line_insets(
+        mut self,
+        insets: impl Fn(usize, &str, u32) -> crate::widgets::LineInset + 'static,
+    ) -> Self {
+        self.code_mut().line_insets = Some(std::rc::Rc::new(insets));
+        self
+    }
+    /// Shapes beside each line of a text area (a list item's number, a
+    /// quote's rule, a code block's wash; `EditorHandle::set_line_marks`),
+    /// given the line's index, its text and what the line before left its
+    /// highlighter. It must depend on nothing but its arguments.
+    #[doc(hidden)]
+    pub fn line_marks(
+        mut self,
+        marks: impl Fn(usize, &str, u32) -> Vec<crate::widgets::LineMark> + 'static,
+    ) -> Self {
+        self.code_mut().line_marks = Some(std::rc::Rc::new(marks));
+        self
+    }
+    /// A text area's scroll groups (`LineInset::scroll_group`, a code
+    /// block's) get the scrollbar scroll views show: one, across the bottom
+    /// of the group that moved last, as it scrolls; its drag scrolls it.
+    #[doc(hidden)]
+    pub fn group_scrollbar(mut self) -> Self {
+        self.code_mut().group_scrollbar = true;
+        self
+    }
     /// Ranges of a text area's text (UTF-8 byte ranges) marked with a colour
     /// behind them, a search's matches; kept current as what `ranges` reads
     /// changes. Only those in view are drawn.
@@ -2081,6 +2138,13 @@ impl View {
     /// `EditorHandle::on_atoms`.
     pub fn on_atoms(mut self, told: impl FnMut(&crate::widgets::AtomEvent<'_>) + 'static) -> Self {
         self.code_mut().on_atoms = Some(Box::new(told));
+        self
+    }
+    /// How a text area's atoms go on the clipboard beyond the app, and come
+    /// back from it (`EditorHandle::set_atom_codec`). (Pin line.)
+    #[doc(hidden)]
+    pub fn atom_codec(mut self, codec: crate::widgets::AtomCodec) -> Self {
+        self.code_mut().atom_codec = Some(codec);
         self
     }
     /// How a text area's atoms show beyond a wash: a mention's colour,
@@ -4518,6 +4582,18 @@ fn placed_as<K: Eq + std::hash::Hash>(
                 .is_some_and(|(.., placed)| placed.at == Some((*index, width.to_bits())))
         })
 }
+/// Tell each of a list's rows (`entries`, holding every key of `keys`) its
+/// index. A function of its own: in the pass's closure the loop shared
+/// registers with all the rest, and paid for it each row.
+#[inline(never)]
+fn index_rows<K: Eq + std::hash::Hash>(
+    entries: &HashMap<K, (NodeId, Signal<usize>, Placed), rustc_hash::FxBuildHasher>,
+    keys: &[(K, usize)],
+) {
+    for (key, index) in keys {
+        entries[key].1.set(*index);
+    }
+}
 /// Fixed-height keyed rows; only the visible range plus overscan is mounted.
 /// `count` and `key` track reactive reads. `build` runs once per mounted key;
 /// its index signal updates when that key moves. Offscreen rows are disposed,
@@ -4865,9 +4941,7 @@ pub fn virtual_list<K: Eq + std::hash::Hash + Clone + 'static>(
                             }
                         });
                     }
-                    for (key, index) in &keys {
-                        entries[key].1.set(*index);
-                    }
+                    index_rows(&entries, &keys);
                     {
                         let mut scene = ui.scene.borrow_mut();
                         // Scrolled with the view around it: as tall as its
@@ -5529,6 +5603,7 @@ fn mount_portal_panel(
     // items closes it); the parent's backdrop dismisses both.
     let mut rare = view.rare.as_mut();
     let dismiss_backdrop = rare.as_mut().and_then(|r| r.dismiss_backdrop.take());
+    let on_dismiss = rare.as_mut().and_then(|r| r.on_dismiss.take());
     let dismiss_backdrop = dismiss_backdrop.unwrap_or(!is_submenu);
     let (placement, modal_placement, autofocus, over, arrow) = rare
         .and_then(|r| r.portal.take())
@@ -5556,6 +5631,7 @@ fn mount_portal_panel(
         });
         (size, styles, painted)
     });
+    let explicit_placement = placement;
     let placement = placement.unwrap_or_default();
     let panel_focusable = view.focusable.unwrap_or(true);
     let layout_target = is_menu.then(|| ui.signal(None));
@@ -5616,15 +5692,30 @@ fn mount_portal_panel(
     let mut over_focus = None;
     if let Some(anchor) = anchor {
         if is_submenu {
-            crate::compose_popover::mount_submenu(
-                screens.clone(),
-                ui,
-                owner,
-                anchor,
-                portal.overlay,
-                portal.position,
-                panel,
-            );
+            if let Some(at) = explicit_placement {
+                crate::compose_popover::mount(
+                    screens.clone(),
+                    ui,
+                    owner,
+                    anchor,
+                    portal.overlay,
+                    portal.position,
+                    panel,
+                    at,
+                    None,
+                    None,
+                );
+            } else {
+                crate::compose_popover::mount_submenu(
+                    screens.clone(),
+                    ui,
+                    owner,
+                    anchor,
+                    portal.overlay,
+                    portal.position,
+                    panel,
+                );
+            }
         } else {
             // `open_over`'s item, among the menu's.
             let over_item = over.map(|id| {
@@ -5747,6 +5838,7 @@ fn mount_portal_panel(
         is_submenu,
         autofocus.unwrap_or(true),
         keeps_focus,
+        on_dismiss,
     );
     // An unnamed popover or menu is named by its trigger, as a browser's
     // popover target is (`aria-labelledby`).
@@ -6718,6 +6810,15 @@ fn mount_element(
         rare.as_ref().is_none_or(|r| r.dismiss_backdrop.is_none()),
         "dismiss_on_backdrop is only supported on modal and popover views"
     );
+    // An app can set it on any view (`View::on_dismiss` is public): it is
+    // heard on modals and popovers only, and a debug build says so, once.
+    #[cfg(debug_assertions)]
+    if rare.as_ref().is_some_and(|r| r.on_dismiss.is_some()) {
+        static TOLD: std::sync::Once = std::sync::Once::new();
+        TOLD.call_once(|| {
+            eprintln!("zgx: on_dismiss is only heard on modal and popover views; others ignore it");
+        });
+    }
     assert!(
         rare.as_ref()
             .is_none_or(|r| r.keyboard_navigation.is_none())
@@ -6730,8 +6831,16 @@ fn mount_element(
         .unwrap_or(false);
     assert!(
         rare.as_ref().is_none_or(|r| r.scrollbar.is_none())
-            || matches!(kind, Kind::Scroll { .. } | Kind::VirtualList(_)),
-        "scrollbar is only supported on scroll, scroll_x, and virtual_list views"
+            || matches!(
+                kind,
+                Kind::Scroll { .. }
+                    | Kind::VirtualList(_)
+                    | Kind::Editor {
+                        multiline: true,
+                        ..
+                    }
+            ),
+        "scrollbar is only supported on scroll, scroll_x, virtual_list and text_area views"
     );
     let scrollbar = rare.as_ref().and_then(|r| r.scrollbar).unwrap_or(false);
     let follow_end = rare.as_ref().and_then(|r| r.follow_end).unwrap_or(false);
@@ -6753,10 +6862,22 @@ fn mount_element(
         keep_scrollbar_style(ui, opened.root);
     }
     ui.open_element(opened.root);
+    // Its children's nodes, made one by one below: room for them at once
+    // where the first room a list takes would not hold them (a dynamic
+    // child, a list or `each`, takes one place; its rows grow its own).
+    if opened.children.len() > crate::scene::FIRST_CHILD_ROOM {
+        reserve_children(ui, opened.child_parent, opened.children.len());
+    }
     for child in std::mem::take(&mut opened.children) {
         mount(ui, opened.child_parent, child, opened.environment.clone());
     }
     close_element(ui, opened)
+}
+/// `mount_element`'s reserve, out of line: most elements have no more
+/// children than a list's first room, and the call alone stays in it.
+#[inline(never)]
+fn reserve_children(ui: &Ui, parent: NodeId, count: usize) {
+    ui.scene.borrow_mut().reserve_children(parent, count);
 }
 /// A scroll view's or a list's own scrollbar style, taken before its
 /// element opens (a list's edges go to its region there) and held for the
@@ -7506,6 +7627,10 @@ fn open_element(
         );
     }
     if let Some(mut source) = svg_compute {
+        // The artwork fills its box from the start, as a replaced box's
+        // own drawing does (`Scene::set_drawing`): laid out with it, in the
+        // frame's one pass (a size given it once the box had one was a
+        // second), with no percentage for the layout above to weigh.
         let child = ui.container(
             root,
             Layout::Overlay,
@@ -7514,17 +7639,10 @@ fn open_element(
                 ..Default::default()
             },
         );
-        // Its size arrives with the frame's layout (deferred: an icon
-        // mounting forces no layout of its own, so a thread of hundreds
-        // lays out once).
-        let size = ui.observe_content_size_deferred(root);
+        ui.scene.borrow_mut().set_drawing(child);
         let scene = ui.scene.clone();
         let (typography, theme) = (environment.typography.clone(), environment.theme.clone());
         ui.bind(root, move || {
-            let (width, height) = size.get();
-            if width.is_nan() || height.is_nan() {
-                return;
-            }
             let mut data = source();
             // `currentColor`: the text colour here, as it changes.
             if data.follows_text_color() {
@@ -7533,15 +7651,6 @@ fn open_element(
             let mut scene = scene.borrow_mut();
             scene.set_kind(child, NodeKind::Svg(data));
             scene.mark_drawn_in_box(child);
-            scene.set_style(
-                child,
-                crate::scene::Style {
-                    width: Some(width),
-                    height: Some(height),
-                    absolute: true,
-                    ..Default::default()
-                },
-            );
         });
     }
     let pictured = canvas_compute.is_some();
@@ -7671,6 +7780,8 @@ fn open_element(
         if let Some(code) = rare.as_deref_mut().and_then(|r| r.code.take()) {
             let CodeOptions {
                 highlighter,
+                line_insets,
+                line_marks,
                 decorations,
                 underlines,
                 current_line,
@@ -7682,7 +7793,18 @@ fn open_element(
                 atoms_when,
                 atom_pointer,
                 atom_style,
+                atom_codec,
+                group_scrollbar,
             } = *code;
+            if group_scrollbar {
+                editor.mount_group_scrollbar(ui);
+            }
+            if line_insets.is_some() {
+                editor.set_line_insets(line_insets);
+            }
+            if line_marks.is_some() {
+                editor.set_line_marks(line_marks);
+            }
             if highlighter.is_some() {
                 editor.set_span_highlighter(highlighter);
                 // Colours may be theme tokens: a new theme colours the lines
@@ -7693,7 +7815,7 @@ fn open_element(
                     theme.color(crate::theme::tok::TEXT_PRIMARY);
                     theme.color(crate::theme::tok::ACCENT);
                     if !first.replace(false) {
-                        editor.rehighlight();
+                        editor.recolor();
                     }
                 });
             }
@@ -7714,6 +7836,9 @@ fn open_element(
             }
             if atom_style.is_some() {
                 editor.set_atom_style(atom_style);
+            }
+            if let Some(codec) = atom_codec {
+                editor.set_atom_codec(codec);
             }
             if let Some(mut atoms) = atoms_when {
                 let editor = editor.clone();
@@ -7759,15 +7884,26 @@ fn open_element(
         }
         let typography = environment.typography.clone();
         let theme = environment.theme.clone();
+        // Bound after its options, so their first runs come before its own:
+        // the editor draws once as it mounts, not once each. That draw's
+        // reads (a custom shaper's) are this binding's too: run again with
+        // its style unchanged, one of them changed, and it draws again (no
+        // binding of its own for it: a mount pays for none).
+        let first = Cell::new(true);
         ui.bind_input(root, move || {
             let style = typography.get();
             let theme = Some(&*theme);
-            editor.set_text_style(
+            let changed = editor.set_text_style(
                 style.color_in(theme),
                 style.size_in(theme),
                 style.font_in(theme),
                 style.wrap,
             );
+            if first.replace(false) {
+                editor.finish_mount();
+            } else if !changed {
+                editor.refresh();
+            }
         });
     }
     if let Some(id) = view.id {
@@ -7874,6 +8010,16 @@ fn watch_active_descendant(
         }
     });
 }
+/// A text area's scrollbar (`View::scrollbar`), over its box, once its own
+/// nodes are in it. Out of line: `close_element`, inlined into every
+/// element's mount, keeps its shape.
+#[cold]
+#[inline(never)]
+fn mount_editor_scrollbar(ui: &mut Ui, root: NodeId) {
+    if let Some(editor) = ui.editor(root) {
+        editor.mount_scrollbar(ui);
+    }
+}
 /// The rest of an element's mounting, once its children are in.
 #[cfg_attr(debug_assertions, inline(never))]
 #[cfg_attr(not(debug_assertions), inline(always))]
@@ -7909,6 +8055,8 @@ fn close_element(ui: &mut Ui, opened: Opened) -> NodeId {
     }
     if let (Some(scroll), Some((viewport, content))) = (scroll_offset, scroll_nodes) {
         mount_scroll(ui, root, viewport, content, scroll, scrollbar, follow_end);
+    } else if scrollbar {
+        mount_editor_scrollbar(ui, root);
     }
     if let Some(mut compute) = compute {
         let weak = ui.downgrade();
@@ -8385,6 +8533,94 @@ pub(crate) fn reveal_in_list(
         ui.prepare_frame();
     }
 }
+/// What a scroll view reveals focus in it with (`mount_scroll`).
+struct ScrollReveal {
+    root: NodeId,
+    viewport: NodeId,
+    content: NodeId,
+    horizontal: bool,
+    offset: Signal<f32>,
+    extent: Signal<(f32, f32)>,
+    size: Signal<(f32, f32)>,
+}
+impl ScrollReveal {
+    /// Moves the view the least that shows focused `target`.
+    ///
+    /// Focused while effects run, with layout to do (a modal's first control,
+    /// as the effect that opens it mounts it), after the next layout: the
+    /// effects still to run hold styles of what just mounted, this view's own
+    /// among them, so laid out now it showed its content the size a scroll
+    /// view has by default (320 wide, whatever its `w`), which observers
+    /// heard and animated from.
+    #[cold]
+    #[inline(never)]
+    fn reveal(self, ui: &Ui, target: NodeId) {
+        if ui.runtime.flushing() && ui.scene.borrow().layout_stale() {
+            self.when_settled(ui, target, None);
+            return;
+        }
+        // Direct focus calls need the same settled allocation as native input.
+        // World bounds include transforms immediately, so an outer scroller
+        // observes the translation applied by an inner bubbling handler.
+        ui.prepare_frame();
+        self.move_to(ui, target);
+    }
+    /// `move_to` once a layout pass has changed nothing since the one at
+    /// `seen`: after-layout work runs in the first pass too, where a viewport
+    /// still has the size its binding gives it in the next. (The preparation's
+    /// own limit on passes bounds it.)
+    fn when_settled(self, ui: &Ui, target: NodeId, seen: Option<u64>) {
+        let weak = ui.downgrade();
+        ui.after_layout(Box::new(move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let revision = ui.scene.borrow().layout_revision();
+            match seen == Some(revision) && !ui.scene.borrow().layout_stale() {
+                true => self.move_to(&ui, target),
+                false => self.when_settled(&ui, target, Some(revision)),
+            }
+        }));
+    }
+    /// `reveal`, laid out.
+    fn move_to(&self, ui: &Ui, target: NodeId) {
+        // A target handler may redirect focus before this event bubbles.
+        if ui.input.focused() != Some(target) || !ui.scene.borrow().contains(self.root) {
+            return;
+        }
+        let Some(movement) = focus_movement(ui, target, self.viewport, self.horizontal) else {
+            return;
+        };
+        let along = |size: (f32, f32)| if self.horizontal { size.0 } else { size.1 };
+        let rtl_of = |scene: &crate::scene::Scene| {
+            self.horizontal && scene.direction(self.root) == crate::scene::Direction::Rtl
+        };
+        let limit = (along(self.extent.get()) as f64 - along(self.size.get()) as f64).max(0.);
+        let rtl = rtl_of(&ui.scene.borrow());
+        let movement = if rtl { -movement } else { movement };
+        let position = (self.offset.get() as f64 + movement).clamp(0., limit) as f32;
+        self.offset.set(position);
+        // A surrounding reactive batch can defer the geometry binding.
+        // Publish this translation now for the next ancestor's focus handler.
+        let mut scene = ui.scene.borrow_mut();
+        if scene.contains(self.content) && ui.input.focused() == Some(target) {
+            let rtl = rtl_of(&scene);
+            let offset = self.offset.get();
+            let translation = match (self.horizontal, rtl) {
+                (true, true) => (offset, 0.),
+                (true, false) => (-offset, 0.),
+                (false, _) => (0., -offset),
+            };
+            scene.set_transform(
+                self.content,
+                crate::scene::Transform {
+                    x: translation.0,
+                    y: translation.1,
+                },
+            );
+        }
+    }
+}
 /// A scroll view's own say, from its opening to `mount_scroll`.
 struct ScrollOpen {
     offset: Signal<f32>,
@@ -8495,30 +8731,19 @@ fn mount_scroll(
             if !ui.input.focus_scrolls() {
                 return;
             }
-            // Direct focus calls need the same settled allocation as native input.
-            // World bounds include transforms immediately, so an outer scroller
-            // observes the translation applied by an inner bubbling handler.
-            ui.prepare_frame();
-            // A target handler may redirect focus before this event bubbles.
-            if ui.input.focused() != Some(cx.target) {
-                return;
-            }
-            let Some(movement) = focus_movement(&ui, cx.target, viewport, horizontal) else {
-                return;
-            };
-            let limit =
-                (main_size(wheel_extent.get()) as f64 - main_size(wheel_size.get()) as f64).max(0.);
-            let rtl = rtl_of(&ui.scene.borrow());
-            let movement = if rtl { -movement } else { movement };
-            let position = (wheel_offset.get() as f64 + movement).clamp(0., limit) as f32;
-            wheel_offset.set(position);
-            // A surrounding reactive batch can defer the geometry binding.
-            // Publish this translation now for the next ancestor's focus handler.
-            let mut scene = ui.scene.borrow_mut();
-            if scene.contains(content) && ui.input.focused() == Some(cx.target) {
-                let rtl = rtl_of(&scene);
-                scene.set_transform(content, translation(wheel_offset.get(), rtl));
-            }
+            let (target, reveal) = (
+                cx.target,
+                ScrollReveal {
+                    root,
+                    viewport,
+                    content,
+                    horizontal,
+                    offset: wheel_offset.clone(),
+                    extent: wheel_extent.clone(),
+                    size: wheel_size.clone(),
+                },
+            );
+            reveal.reveal(&ui, target);
         }
         if let InputEvent::Scroll {
             x,
@@ -9806,6 +10031,12 @@ impl NodeHandle {
     pub fn node(&self) -> NodeId {
         self.node
     }
+    /// Whether it is `ui`'s (a window's, as nodes are: their ids say nothing
+    /// in another).
+    #[doc(hidden)]
+    pub fn is_in(&self, ui: &Ui) -> bool {
+        self.ui.same(&ui.downgrade())
+    }
     /// Whether `other` lies inside this node (a descendant, not the node
     /// itself), in the same window; `false` once either or the UI is gone.
     pub fn holds(&self, other: &NodeHandle) -> bool {
@@ -10091,6 +10322,19 @@ impl NodeHandle {
         let ui = self.ui.upgrade()?;
         ui.editor(self.node)
     }
+    /// Its text, atoms and undo, on every target: the editor it is, or on
+    /// the DOM a text area with atoms (its model's). (Pin line.)
+    #[doc(hidden)]
+    pub fn text_edits(&self) -> Option<Rc<dyn crate::widgets::TextEdits>> {
+        if let Some(editor) = self.editor() {
+            return Some(Rc::new(editor));
+        }
+        #[cfg(feature = "dom")]
+        if let Some(hooks) = &self.dom {
+            return hooks.editor();
+        }
+        None
+    }
     /// An editor's selection, `(anchor, focus)` in UTF-8 byte offsets
     /// (see `EditorHandle::selection`); `None` for other nodes.
     pub fn selection(&self) -> Option<(usize, usize)> {
@@ -10259,6 +10503,13 @@ impl NodeHandle {
             return false;
         };
         ui.input.lock_pointer(&ui.scene, self.node)
+    }
+    /// If this is a scroll view or list (or inside one's root), how far it is
+    /// scrolled along its axis and how far it can scroll: `(offset, range)`.
+    #[doc(hidden)]
+    pub fn scroll_extent(&self) -> Option<(f32, f32)> {
+        let (offset, range, _) = self.ui.upgrade()?.scroll_report(self.node)?;
+        Some((offset, range))
     }
     /// Let the pointer go, if the node holds its lock.
     pub fn unlock_pointer(&self) {

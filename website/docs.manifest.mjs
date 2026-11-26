@@ -42,6 +42,10 @@ export const internal = [
   // Until Wing makes the audio API public (with zgx-dom's): then a page
   // beside reference/3d.
   'docs/reference/audio.md',
+  // Native modules and the value layout they read: unstable before 1.0,
+  // then pages beside the Luau set's.
+  'docs/value-types.md',
+  'docs/modules.md',
 ];
 
 export const sets = [
@@ -130,18 +134,20 @@ export const sets = [
         description: 'Plugins that add to an app, filter it and replace parts of it, and what the app lets them see and do.' },
       { slug: 'accessibility-audit', src: 'docs/accessibility-audit.md', title: 'Accessibility audit',
         description: 'zgx audit: what a screen reader gets of an app, through what it opens, as JSON for agents and CI.' },
+      { slug: 'controls-on-screen', src: 'docs/reference/native.md', title: 'Controls on screen', sections: ['Controls on screen'], unwrap: true,
+        description: 'ui.controls, ui.press and ui.text_of: what is on screen as the accessibility tree has it, for guides and tests.' },
       { slug: 'design-systems', src: 'docs/reference/design.md', title: 'Design systems' },
       '---API reference---',
       { slug: 'reference', src: 'docs/reference/index.md', title: 'Reading the reference' },
       { slug: 'reference/api', mdx: 'luau/api.mdx' },
       { slug: 'reference/state', src: 'docs/reference/state.md', title: 'State and components', intro: true,
-        sections: ['Making state', 'State methods', 'Actions', 'Computeds, effects, batches', 'Large data', 'Refs', 'Components', 'Example', 'Modules and templates', 'Plugins and slots', 'Gotchas'] },
+        sections: ['Making state', 'State methods', 'Actions', 'Computeds, effects, batches', 'Large data', 'Measuring frames', 'Refs', 'Components', 'Example', 'Modules and templates', 'Plugins and slots', 'Gotchas'] },
       { slug: 'reference/properties', src: 'docs/reference/properties.md', title: 'Properties' },
       { slug: 'reference/events', src: 'docs/reference/events.md', title: 'Events' },
       { slug: 'reference/containers', src: 'docs/reference/containers.md', title: 'Containers' },
       { slug: 'reference/controls', src: 'docs/reference/controls.md', title: 'Controls' },
       { slug: 'reference/text', src: 'docs/reference/text.md', title: 'Text', intro: true,
-        sections: ['Text', 'Text options', 'Rich text and spans', 'Example', 'Markdown', 'Fonts', 'Selectable text', 'Gotchas'] },
+        sections: ['Text', 'Text options', 'Rich text and spans', 'Example', 'Markdown', 'Fonts', 'Measuring text', 'Selectable text', 'Gotchas'] },
       { slug: 'reference/dynamic', src: 'docs/reference/dynamic.md', title: 'Dynamic content' },
       { slug: 'reference/scrolling', src: 'docs/reference/scrolling.md', title: 'Scrolling and lists' },
       { slug: 'reference/overlays', src: 'docs/reference/overlays.md', title: 'Overlays and menus' },

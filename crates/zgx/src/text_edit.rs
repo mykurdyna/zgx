@@ -187,6 +187,10 @@ pub struct Atom {
     /// How it shows, over its text area's atom style (a mention's icon).
     #[doc(hidden)]
     pub style: Option<std::sync::Arc<crate::editor_atom_style::AtomStyle>>,
+    /// What assistive technology reads for it instead of its text (a
+    /// mention's full name), as one unit either way.
+    #[doc(hidden)]
+    pub name: Option<std::sync::Arc<str>>,
 }
 impl Atom {
     /// An atom named `id` over `range`, with no wash or payload.
@@ -197,6 +201,7 @@ impl Atom {
             wash: None,
             payload: None,
             style: None,
+            name: None,
         }
     }
 }
@@ -211,6 +216,7 @@ impl PartialEq for Atom {
                 _ => false,
             }
             && self.style == other.style
+            && self.name == other.name
     }
 }
 impl Eq for Atom {}
@@ -795,11 +801,17 @@ impl TextEditor {
             }
             None => self.over_atoms(self.selection.range()),
         };
+        let before = self.selection;
         self.selection = Selection {
             anchor: range.start,
             focus: range.end,
         };
         let changed = self.replace(label, None);
+        // Undone, the caret goes back where typing left it (after the `@que`
+        // it replaced), not over the text it took.
+        if changed && let Some(step) = self.undo.back_mut() {
+            step.before = before;
+        }
         let start = range.start;
         let id = self.new_atom_id();
         let atom = Atom {
@@ -808,6 +820,7 @@ impl TextEditor {
             wash,
             payload,
             style: None,
+            name: None,
         };
         // (The text was already there: no step holds it, and any atom on it
         // goes as an edit would have taken it.)
@@ -824,6 +837,30 @@ impl TextEditor {
             step.created.push(atom);
         }
         Some(id)
+    }
+    /// What assistive technology reads for atom `id` instead of its text
+    /// (`Atom::name`). Whether it has that atom.
+    #[doc(hidden)]
+    pub fn set_atom_name(&mut self, id: u64, name: Option<std::sync::Arc<str>>) -> bool {
+        let Some(state) = self.atom_state.as_deref_mut() else {
+            return false;
+        };
+        let Some(atom) = state.atoms.iter_mut().find(|atom| atom.id == id) else {
+            return false;
+        };
+        if atom.name != name {
+            atom.name = name.clone();
+            state.revision = state.revision.wrapping_add(1);
+        }
+        // Its copies undo and redo bring back are named too.
+        for step in state.steps.values_mut() {
+            for kept in step.created.iter_mut().chain(&mut step.destroyed) {
+                if kept.id == id {
+                    kept.name = name.clone();
+                }
+            }
+        }
+        true
     }
     /// Set its atoms (a draft's): by start, within the text, on grapheme
     /// boundaries, none empty or overlapping; any that is not goes. Not an
@@ -927,8 +964,10 @@ impl TextEditor {
         self.revision
     }
     /// The one change made since `revision`, if it made exactly one: where,
-    /// the length it replaced and the length it put there.
-    pub(crate) fn edit_after(&self, revision: u64) -> Option<(usize, usize, usize)> {
+    /// the length it replaced and the length it put there (bytes, on
+    /// characters' boundaries).
+    #[doc(hidden)]
+    pub fn edit_after(&self, revision: u64) -> Option<(usize, usize, usize)> {
         let sync = self.sync.as_ref()?;
         (revision.wrapping_add(1) == self.revision).then_some(sync.last_edit)
     }
@@ -989,6 +1028,10 @@ impl TextEditor {
         }
     }
     fn boundary(&self, offset: usize) -> usize {
+        self.out_of_atoms(self.grapheme_floor(offset))
+    }
+    /// `offset` moved back to a grapheme boundary.
+    fn grapheme_floor(&self, offset: usize) -> usize {
         let mut offset = offset.min(self.text.len());
         while !self.text.is_char_boundary(offset) {
             offset -= 1;
@@ -996,22 +1039,45 @@ impl TextEditor {
         let (base, text) = self.text.around(offset);
         let local = offset - base;
         let mut cursor = unicode_segmentation::GraphemeCursor::new(local, text.len(), true);
-        let at = if cursor.is_boundary(&text, 0).unwrap_or(false) {
+        if cursor.is_boundary(&text, 0).unwrap_or(false) {
             offset
         } else {
             base + cursor.prev_boundary(&text, 0).ok().flatten().unwrap_or(0)
-        };
-        self.out_of_atoms(at)
+        }
+    }
+    /// `anchor` to `focus` on grapheme boundaries, out of atoms: a caret at
+    /// the nearer edge of one it is inside, a selection widened to take
+    /// whole each atom it goes into (a double click on a word of a chip
+    /// selects the chip).
+    fn selection_between(&self, anchor: usize, focus: usize) -> Selection {
+        let (anchor, focus) = (self.grapheme_floor(anchor), self.grapheme_floor(focus));
+        if anchor == focus || !self.has_atoms() {
+            let at = self.out_of_atoms(anchor);
+            let to = self.out_of_atoms(focus);
+            return Selection {
+                anchor: at,
+                focus: to,
+            };
+        }
+        if anchor < focus {
+            Selection {
+                anchor: self.atom_start_of(anchor),
+                focus: self.atom_end_of(focus),
+            }
+        } else {
+            Selection {
+                anchor: self.atom_end_of(anchor),
+                focus: self.atom_start_of(focus),
+            }
+        }
     }
     /// Select from `anchor` to `focus`, each moved back to a grapheme
-    /// boundary. Ends a typing run and cancels any preedit.
+    /// boundary, a selection taking whole any atom it goes into. Ends a
+    /// typing run and cancels any preedit.
     pub fn set_selection(&mut self, anchor: usize, focus: usize) {
         self.run = None;
         self.cancel_preedit();
-        self.selection = Selection {
-            anchor: self.boundary(anchor),
-            focus: self.boundary(focus),
-        };
+        self.selection = self.selection_between(anchor, focus);
     }
     /// Select all the text.
     pub fn select_all(&mut self) {
@@ -1029,6 +1095,38 @@ impl TextEditor {
     /// even of one character, as AppKit undoes a paste apart from typing.
     pub fn insert_pasted(&mut self, value: &str) -> bool {
         self.replace(value, None)
+    }
+    /// `insert_pasted`, with `atoms` made over the pasted text (their
+    /// ranges in bytes of `value`), new ids each: one undo step makes and
+    /// takes them with it (a copy's chips pasted).
+    pub fn insert_pasted_atoms(&mut self, value: &str, atoms: Vec<(Range<usize>, Atom)>) -> bool {
+        if atoms.is_empty() {
+            return self.insert_pasted(value);
+        }
+        let start = self.over_atoms(self.selection.range()).start;
+        if !self.replace(value, None) {
+            return false;
+        }
+        let state = self.atom_state.get_or_insert_default();
+        let mut made = Vec::with_capacity(atoms.len());
+        for (range, atom) in atoms {
+            let id = state.next;
+            state.next += 1;
+            let atom = Atom {
+                id,
+                range: start + range.start..start + range.end,
+                ..atom
+            };
+            state.atoms.push(atom.clone());
+            state.changes.push(AtomChange::Added(atom.clone()));
+            made.push(atom);
+        }
+        state.atoms.sort_by_key(|atom| atom.range.start);
+        state.revision = state.revision.wrapping_add(1);
+        if let Some(step) = self.last_step_atoms() {
+            step.created.extend(made);
+        }
+        true
     }
     /// `insert`, as an edit of `run`'s kind (`None`: a step of its own).
     fn replace(&mut self, value: &str, run: Option<Run>) -> bool {
@@ -1531,8 +1629,10 @@ impl TextEditor {
     fn move_to(&mut self, offset: usize, extend: bool) {
         self.run = None;
         self.cancel_preedit();
-        self.selection.focus = self.boundary(offset);
-        if !extend {
+        if extend {
+            self.selection = self.selection_between(self.selection.anchor, offset);
+        } else {
+            self.selection.focus = self.boundary(offset);
             self.selection.anchor = self.selection.focus;
         }
     }
@@ -3189,7 +3289,7 @@ mod atom_tests {
             e.selection(),
             Selection {
                 anchor: 2,
-                focus: 8
+                focus: 17
             }
         );
         e.set_selection(2, 17);

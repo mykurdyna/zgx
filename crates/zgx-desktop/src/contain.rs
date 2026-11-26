@@ -51,7 +51,7 @@ pub(crate) fn run<R>(
             Some(done)
         }
         Err(payload) => {
-            let message = message(payload.as_ref());
+            let message = crate::application::with_panic_site(message(payload.as_ref()));
             if fault.as_ref().is_none_or(|last| last.message != message) {
                 eprintln!(
                     "zgx: contained a panic in {what} ({message}); it is skipped until it \
@@ -225,6 +225,9 @@ mod tests {
     /// a second, reported once, and the caller goes on each frame.
     #[test]
     fn a_piece_panicking_every_frame_is_reported_once_and_skipped() {
+        // Before the first panic: another test installs the hook, the
+        // process's one, and a panic it notes is another message.
+        crate::application::note_panic_sites();
         let (start, mut fault) = (Instant::now(), None);
         let (runs, reports, frames) = (Cell::new(0), Cell::new(0), Cell::new(0));
         // 120 frames over two seconds, what it draws changing every frame.
@@ -251,6 +254,67 @@ mod tests {
             "tried at the first frame, then once a second later"
         );
         assert_eq!(reports.get(), 1, "the same panic is reported once");
+    }
+
+    /// A contained panic's report says where it was (the site the panic
+    /// hook noted), as a script's error says where it failed.
+    #[test]
+    fn a_contained_panic_is_reported_where_it_was() {
+        crate::application::note_panic_sites();
+        let mut fault = None;
+        let reported = std::cell::RefCell::new(String::new());
+        let panics_at = line!() + 7;
+        let _: Option<()> = run(
+            &mut fault,
+            0,
+            Instant::now(),
+            "a popup's frame",
+            |message| *reported.borrow_mut() = message.to_string(),
+            || panic!("min > max"),
+        );
+        let reported = reported.into_inner();
+        assert!(
+            reported.contains(&format!("contain.rs:{panics_at}: min > max")),
+            "{reported}"
+        );
+    }
+
+    #[test]
+    fn a_contained_panic_names_the_host_callback_it_was_in_and_where_it_was_registered() {
+        // A host action panicking in a library it calls: the report names
+        // the action and the host's line that registered it.
+        crate::application::note_panic_sites();
+        let mut fault = None;
+        let reported = std::cell::RefCell::new(String::new());
+        let registered = std::panic::Location::caller();
+        let _: Option<()> = run(
+            &mut fault,
+            0,
+            Instant::now(),
+            "a popup's frame",
+            |message| *reported.borrow_mut() = message.to_string(),
+            || zgx::callback_site::run("a host action", registered, || panic!("deep")),
+        );
+        let reported = reported.into_inner();
+        assert!(
+            reported.contains(&format!(
+                "deep (in a host action registered at {}:{})",
+                registered.file(),
+                registered.line()
+            )),
+            "{reported}"
+        );
+        // Taken: a later panic outside any callback says nothing of it.
+        let reported = std::cell::RefCell::new(String::new());
+        let _: Option<()> = run(
+            &mut None,
+            0,
+            Instant::now(),
+            "a popup's frame",
+            |message| *reported.borrow_mut() = message.to_string(),
+            || panic!("plain"),
+        );
+        assert!(!reported.into_inner().contains("registered at"));
     }
 
     /// Unchanged, a faulted piece isn't tried again, however long; changed,
@@ -398,6 +462,9 @@ mod tests {
     /// Another panic in the same piece is reported too.
     #[test]
     fn a_different_panic_is_reported_again() {
+        // Before the first panic: another test installs the hook, the
+        // process's one, and a panic it notes is another message.
+        crate::application::note_panic_sites();
         let (start, mut fault) = (Instant::now(), None);
         let reported = std::cell::RefCell::new(Vec::new());
         for (second, message) in [(0, "first"), (2, "first"), (4, "second")] {
@@ -410,6 +477,12 @@ mod tests {
                 || panic!("{message}"),
             );
         }
-        assert_eq!(*reported.borrow(), ["first", "second"]);
+        // Each led by where it panicked, as the panic hook notes it.
+        let reported = reported.borrow();
+        assert_eq!(reported.len(), 2, "{reported:?}");
+        assert!(
+            reported[0].ends_with("first") && reported[1].ends_with("second"),
+            "{reported:?}"
+        );
     }
 }

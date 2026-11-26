@@ -23,6 +23,9 @@ pub fn glyph_image(
     if let Some(image) = crate::direct_write_glyphs::glyph_image(fonts, key) {
         return Some(image);
     }
+    // swash's, thickened by `SMOOTHING` as CoreGraphics would (zgx's swash
+    // fork, `Render::dilate_box`); Core Text's only for a face whose shapes
+    // swash can't draw (macOS 26's PingFang, `hvgl` only).
     let image = swash.get_image_uncached(fonts, key);
     #[cfg(target_os = "macos")]
     if image
@@ -32,6 +35,95 @@ pub fn glyph_image(
         return crate::core_text_glyphs::glyph_image(fonts, key).or(image);
     }
     image
+}
+/// How macOS's font smoothing thickens text of colour `color` (its alpha
+/// aside), for `smoothed`: 0 not at all (off macOS, and where the user
+/// turned smoothing off), else 1 to 5, its luminance in the four steps Core
+/// Graphics takes, plus one. macOS thickens all text, light text most: a
+/// line of Geist at 2x gains 17% coverage in black and 30% in white.
+#[doc(hidden)]
+pub fn smoothing(color: zgx::scene::Color) -> u8 {
+    #[cfg(target_os = "macos")]
+    if font_smoothing() {
+        // As CoreGraphics buckets it (`CGFontRenderingGetCustomAntialiasingStyle`):
+        // the colour's linear-light luminance, in quarters.
+        let linear = |c: u8| {
+            let c = f32::from(c) / 255.;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let luminance =
+            0.2126 * linear(color.0) + 0.7152 * linear(color.1) + 0.0722 * linear(color.2);
+        return 1 + (4. * luminance + 0.5).floor().clamp(0., 4.) as u8;
+    }
+    let _ = color;
+    0
+}
+/// What `set_font_smoothing` was last given: 0 the system's, 1 on, 2 off.
+static FONT_SMOOTHING: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// How many times `set_font_smoothing` changed it.
+static FONT_SMOOTHING_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Whether macOS text is thickened as macOS's font smoothing thickens it
+/// (`smoothing`): `None` as the user's macOS setting says (on unless they
+/// turned it off), `Some(false)` never (lighter text, as Core Text draws its
+/// outlines alone), `Some(true)` always. For every window: each draws all
+/// its text again on its next frame (`GpuRenderer::render`), which a host
+/// asks for (a window's redraw). Nothing changes off macOS.
+#[doc(hidden)]
+pub fn set_font_smoothing(on: Option<bool>) {
+    use std::sync::atomic::Ordering;
+    let value = match on {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    if FONT_SMOOTHING.swap(value, Ordering::Relaxed) != value {
+        FONT_SMOOTHING_EPOCH.fetch_add(1, Ordering::Relaxed);
+    }
+}
+/// How many times `set_font_smoothing` has changed what text is drawn at:
+/// a renderer that drew at another draws all its text again.
+#[doc(hidden)]
+pub fn font_smoothing_epoch() -> u64 {
+    FONT_SMOOTHING_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// Whether text is thickened now: as `set_font_smoothing` says, else as
+/// the user's macOS setting does.
+#[cfg(target_os = "macos")]
+fn font_smoothing() -> bool {
+    match FONT_SMOOTHING.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => crate::core_text_glyphs::font_smoothing_allowed(),
+    }
+}
+/// `key` for its glyph drawn thickened as `smoothing` says.
+#[doc(hidden)]
+pub fn smoothed(key: cosmic_text::CacheKey, smoothing: u8) -> cosmic_text::CacheKey {
+    use cosmic_text::CacheKeyFlags;
+    let mut key = key;
+    key.flags = (key.flags - CacheKeyFlags::SMOOTHING)
+        | CacheKeyFlags::from_bits_retain(u32::from(smoothing.min(5)) << 6);
+    key
+}
+/// `key` for its glyph drawn at `scale` device pixels a point on macOS:
+/// hinted at 1x, unhinted above. swash's hinting (skrifa's autohinter, on
+/// faces with no instructions such as SF) is none of macOS's: at 2x Core
+/// Text hints nothing (CoreGraphics' own autohinter runs only on whole
+/// pixel sizes from 7 to 18), and unhinted swash matches it to a mean of
+/// 0.02 a pixel where hinted it was 0.13 off. At 1x CoreGraphics does
+/// autohint, its own way, so swash's stays there for now.
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub fn hinted_at(key: cosmic_text::CacheKey, scale: f32) -> cosmic_text::CacheKey {
+    let mut key = key;
+    if scale != 1. {
+        key.flags |= cosmic_text::CacheKeyFlags::DISABLE_HINTING;
+    }
+    key
 }
 /// The largest glyph `glyph_image` draws, in pixels: the GPU renderer's
 /// atlas side, past which it draws none either.
@@ -340,7 +432,7 @@ impl ShapedText {
         set_buffer_text(fonts, &mut buffer, &text, font, size);
         // Editors need a visual row for the caret after a final line ending;
         // add it unless cosmic-text already ended with that empty line.
-        if text.ends_with(['\r', '\n']) && ends_open(&buffer) {
+        if text.ends_with(['\r', '\n', '\u{1e}']) && ends_open(&buffer) {
             buffer.lines.push(cosmic_text::BufferLine::new(
                 "",
                 cosmic_text::LineEnding::None,
@@ -378,8 +470,10 @@ impl ShapedText {
             .runs()
             .first()
             .map_or(1., |run| run.font.line_height.resolve(run.font_size));
-        if rich.options() == Default::default()
-            && rich.text().ends_with(['\r', '\n'])
+        // An editor's line ending in a break of its own (U+001E) keeps its
+        // last row whatever its options.
+        if ((rich.options() == Default::default() && rich.text().ends_with(['\r', '\n']))
+            || rich.text().ends_with('\u{1e}'))
             && ends_open(&buffer)
         {
             let font = rich.runs().last().unwrap();
@@ -394,6 +488,12 @@ impl ShapedText {
                 .last_mut()
                 .unwrap()
                 .set_align(alignment(&font.font));
+            // The buffer was shaped before the row joined it: lay the row out
+            // too, where an editor's own break ends the text.
+            if rich.text().ends_with('\u{1e}') {
+                let last = buffer.lines.len() - 1;
+                buffer.line_layout(fonts, last);
+            }
             buffer.shape_until_scroll(fonts, false);
         }
         let mut offset = 0;
@@ -994,13 +1094,11 @@ impl CpuTextRaster {
         for run in buffer.layout_runs() {
             for glyph in run.glyphs {
                 let p = glyph.physical((0., 0.), 1.);
-                if let Some(image) = glyph_image(&mut self.swash, &mut self.fonts, p.cache_key) {
-                    images.push((
-                        p.x,
-                        p.y + run.line_y as i32,
-                        rich.runs()[run_at(rich, starts[run.line_i] + glyph.start)].color,
-                        image,
-                    ));
+                let color = rich.runs()[run_at(rich, starts[run.line_i] + glyph.start)].color;
+                // Thickened for its run's colour, as the GPU renderer keys it.
+                let key = smoothed(p.cache_key, smoothing(color));
+                if let Some(image) = glyph_image(&mut self.swash, &mut self.fonts, key) {
+                    images.push((p.x, p.y + run.line_y as i32, color, image));
                 }
             }
         }
@@ -1897,15 +1995,25 @@ pub(crate) fn truncated(
         .unwrap_or((0, 0, 0, 0.));
     let offset = starts.get(row.0).copied().unwrap_or(0);
     let start = (offset + row.1).min(rich.text().len());
-    let raw_end = (offset + row.2).min(rich.text().len());
-    let end = rich
-        .text()
-        .grapheme_indices(true)
-        .map(|(i, _)| i)
-        .chain(std::iter::once(rich.text().len()))
-        .take_while(|i| *i <= raw_end)
-        .last()
-        .unwrap_or(0);
+    let text_len = rich.text().len();
+    // One line's ellipsis may cut inside the word that overflows, as CSS's
+    // text-overflow does: up to where the next row (the rest of its line)
+    // ends. A clip, and a clamp of several lines, cut the text of their own
+    // last row, as -webkit-line-clamp does, and take none of the next.
+    let raw_end = match rows.get(limit) {
+        Some(next) if limit == 1 && next.0 == row.0 && options.overflow != TextOverflow::Clip => {
+            (offset + next.2).min(text_len)
+        }
+        _ => (offset + row.2).min(text_len),
+    };
+    // Every grapheme boundary up to the cut, in order: the cut is the last.
+    let scan = || {
+        rich.text()
+            .grapheme_indices(true)
+            .map(|(i, _)| i)
+            .chain(std::iter::once(text_len))
+            .take_while(move |i| *i <= raw_end)
+    };
     let make = |fonts: &mut FontSystem, cut: usize, ellipsis: bool| {
         let mut content = rich.text()[..cut].to_owned();
         let mut runs: Vec<_> = rich
@@ -1959,16 +2067,20 @@ pub(crate) fn truncated(
         rich_buffer_raw(fonts, &truncated, width, None, ellipsis)
     };
     if options.overflow == TextOverflow::Clip {
-        return Some(make(fonts, end, false));
+        return Some(make(fonts, scan().last().unwrap_or(0), false));
     }
-    let mut boundaries: Vec<_> = rich
-        .text()
-        .grapheme_indices(true)
-        .map(|(i, _)| i)
-        .take_while(|i| *i < end)
-        .filter(|i| *i >= start)
-        .collect();
-    boundaries.push(end);
+    // The row's boundaries and the cut, in one pass over the text: those
+    // from where the row starts, the cut last; just the cut when it falls
+    // before the row (none of the row kept).
+    let mut boundaries: Vec<_> = scan().filter(|i| *i >= start).collect();
+    let end = match boundaries.last() {
+        Some(&end) => end,
+        None => {
+            let end = scan().last().unwrap_or(0);
+            boundaries.push(end);
+            end
+        }
+    };
     let fits = |probe: &Buffer| {
         probe.layout_runs().count() <= limit
             && width.is_none_or(|w| probe.layout_runs().all(|r| r.line_w <= w + 0.001))
@@ -2242,22 +2354,29 @@ fn rich_buffer_built<const BOX_SPANS: bool>(
             && runs[end].font_size == run.font_size
             && runs[end].range.start == runs[end - 1].range.end
             // A padded run's room goes around it alone (an inline box is one).
-            && run.padding[0] == 0.
-            && runs[end].padding[0] == 0.
+            && run.across_padding() == (0., 0.)
+            && runs[end].across_padding() == (0., 0.)
         {
             end += 1;
         }
         let mut attributes = attrs(&run.font, run.font_size.max(1.));
-        if run.padding[0] > 0. {
-            // Negative down: all of it before the text (`TextRun::padding`),
-            // which the shaper takes as a negative padding.
-            let across = if run.padding[1] < 0. {
-                leads = true;
-                -2. * run.padding[0]
+        let (before, after) = run.across_padding();
+        if before > 0. || after > 0. {
+            let size = run.font_size.max(1.);
+            // Negative down: asymmetric edge padding (`TextRun::padding`):
+            // lead-only uses negative padding, trailing or both use edges.
+            if run.padding[1] < 0. {
+                if before > 0. {
+                    leads = true;
+                }
+                if after > 0. {
+                    attributes = attributes.padding_edges(before / size, after / size);
+                } else {
+                    attributes = attributes.padding(-before / size);
+                }
             } else {
-                run.padding[0]
-            };
-            attributes = attributes.padding(across / run.font_size.max(1.));
+                attributes = attributes.padding(before / size);
+            }
             if run.font.features.is_inline_box() {
                 let boxes = boxes.get_or_insert_with(|| rich.inline_boxes());
                 attributes = attributes.inline_box(box_at(boxes, run.range.start));
@@ -2405,7 +2524,7 @@ mod rich_tests {
         assert_eq!(medium, regular, "its own Book, not Geist's Medium");
     }
     #[test]
-    fn an_ellipsis_without_a_clamp_cuts_inside_a_word_where_a_clamp_cuts_after_one() {
+    fn an_ellipsis_without_a_clamp_cuts_inside_a_word() {
         use zgx::text_layout::{TextOptions, TextOverflow};
         let mut fonts = FontSystem::new();
         let text = "The Hay Wain - Wikipedia";
@@ -2423,26 +2542,88 @@ mod rich_tests {
             .map(|row| row.line_w)
             .fold(0_f32, f32::max);
         let width = whole * 0.85;
-        let shown = |options: TextOptions, fonts: &mut FontSystem| {
-            let buffer = rich_buffer(fonts, &rich.clone().with_options(options), Some(width), None);
-            assert_eq!(buffer.layout_runs().count(), 1);
-            assert!(buffer.layout_runs().all(|row| row.line_w <= width + 0.001));
-            buffer.lines.iter().map(|line| line.text().to_owned()).collect::<String>()
+        let options = TextOptions {
+            overflow: TextOverflow::Ellipsis,
+            line_clamp: None,
         };
-        let single = shown(
-            TextOptions { overflow: TextOverflow::Ellipsis, line_clamp: None },
-            &mut fonts,
+        let buffer = rich_buffer(&mut fonts, &rich.with_options(options), Some(width), None);
+        assert_eq!(buffer.layout_runs().count(), 1);
+        assert!(buffer.layout_runs().all(|row| row.line_w <= width + 0.001));
+        let shown: String = buffer
+            .lines
+            .iter()
+            .map(|line| line.text().to_owned())
+            .collect();
+        assert!(
+            shown.starts_with("The Hay Wain - W") && shown.ends_with('…'),
+            "{shown}"
         );
-        let clamped = shown(
-            TextOptions {
-                overflow: TextOverflow::Ellipsis,
-                line_clamp: std::num::NonZeroU32::new(1),
-            },
-            &mut fonts,
-        );
-        assert!(single.starts_with("The Hay Wain - W") && single.ends_with('…'), "{single}");
-        assert!(clamped.starts_with("The Hay Wain") && !clamped.contains("Wi"), "{clamped}");
     }
+
+    #[test]
+    fn one_line_ellipsis_cuts_inside_the_word_that_overflows() {
+        use zgx::text_layout::{TextOptions, TextOverflow};
+        let mut fonts = FontSystem::new();
+        let text = "aa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let rich = RichText::new(
+            text,
+            vec![TextRun {
+                range: 0..text.len(),
+                font_size: 14.,
+                ..Default::default()
+            }],
+        )
+        .unwrap()
+        .with_options(TextOptions {
+            overflow: TextOverflow::Ellipsis,
+            line_clamp: std::num::NonZeroU32::new(1),
+        });
+        let buffer = rich_buffer(&mut fonts, &rich, Some(120.), None);
+        let shown: String = buffer
+            .lines
+            .iter()
+            .map(|line| line.text().to_owned())
+            .collect();
+        assert!(
+            shown.ends_with("b…"),
+            "cut inside the long word, not after `aa`: {shown:?}"
+        );
+    }
+    #[test]
+    fn a_clamp_of_several_lines_ends_its_ellipsis_at_a_word() {
+        use zgx::text_layout::{TextOptions, TextOverflow};
+        let mut db = cosmic_text::fontdb::Database::new();
+        db.load_font_data(
+            include_bytes!("../../zgx-gpu/tests/fonts/Geist-500-subset.ttf").to_vec(),
+        );
+        let mut fonts = FontSystem::new_with_locale_and_db("en-US".into(), db);
+        let text = "aa bb cc dd ee ff gg hh ii jj kk ll mm nn oo pp qq rr ss tt";
+        let rich = RichText::new(
+            text,
+            vec![TextRun {
+                range: 0..text.len(),
+                font_size: 14.,
+                ..Default::default()
+            }],
+        )
+        .unwrap()
+        .with_options(TextOptions {
+            overflow: TextOverflow::Ellipsis,
+            line_clamp: std::num::NonZeroU32::new(2),
+        });
+        // Whatever the width, the clamp ends at a word: no space is left before the ellipsis.
+        for width in (40..=140).step_by(10) {
+            let buffer = rich_buffer(&mut fonts, &rich, Some(width as f32), None);
+            let shown: String = buffer
+                .lines
+                .iter()
+                .map(|line| line.text().to_owned())
+                .collect();
+            assert!(shown.ends_with('\u{2026}'), "{width}: {shown:?}");
+            assert!(!shown.contains(" \u{2026}"), "{width}: {shown:?}");
+        }
+    }
+
     #[test]
     fn display_line_clamp_shapes_ellipsis_and_excludes_hidden_link_geometry() {
         use zgx::text_layout::{TextOptions, TextOverflow};
@@ -3096,8 +3277,9 @@ pub fn rich_decorations_in<'a>(
                         Rect::new(left, top, right - left, height + 2. * run.padding[1])
                     } else if run.padding != [0.; 2] || run.radius > 0. {
                         let (above, below) = (run.font_size * 0.92, run.font_size * 0.24);
-                        let top = line.line_y - above - run.padding[1];
-                        Rect::new(left, top, right - left, above + below + 2. * run.padding[1])
+                        let py = run.padding[1].max(0.);
+                        let top = line.line_y - above - py;
+                        Rect::new(left, top, right - left, above + below + 2. * py)
                     } else {
                         Rect::new(left, line.line_top, right - left, line.line_height)
                     };
@@ -3120,13 +3302,15 @@ pub fn rich_decorations_in<'a>(
                         strike: false,
                     });
                 }
-                // A lead's room (an atom's icon, `TextRun::padding` negative
-                // down) is no text: its lines start after it, as the web's
-                // decorations cover the text, not an inline box's padding.
-                let left = if run.padding[1] < 0. {
-                    (left + 2. * run.padding[0]).min(right)
+                // Edge padding (`TextRun::padding` negative down: an atom's
+                // icon/inset room) is no text: its lines cover the text only.
+                let (left, right) = if run.padding[1] < 0. {
+                    let (before, after) = run.across_padding();
+                    let left = (left + before).min(right);
+                    let right = (right - after).max(left);
+                    (left, right)
                 } else {
-                    left
+                    (left, right)
                 };
                 for (decoration, y, strike) in [
                     (
@@ -3362,5 +3546,72 @@ mod wash_tests {
         )
         .unwrap();
         assert_eq!(washes(&apart).len(), 2, "two spans side by side: two");
+    }
+
+    #[test]
+    fn asymmetric_atom_edge_padding_shapes_lead_and_trail() {
+        let mut fonts = FontSystem::new();
+        let width_of = |fonts: &mut FontSystem, padding: [f32; 2]| {
+            let rich = RichText::new(
+                "a x b",
+                vec![
+                    TextRun {
+                        range: 0..2,
+                        font_size: 14.,
+                        ..Default::default()
+                    },
+                    TextRun {
+                        range: 2..3,
+                        font_size: 14.,
+                        padding,
+                        underline: Some(zgx::rich_text::Decoration::new(1.)),
+                        ..Default::default()
+                    },
+                    TextRun {
+                        range: 3..5,
+                        font_size: 14.,
+                        ..Default::default()
+                    },
+                ],
+            )
+            .unwrap();
+            let buffer = rich_buffer(fonts, &rich, None, None);
+            let run = buffer.layout_runs().next().unwrap();
+            let g = run.glyphs.iter().find(|g| g.start == 2).unwrap();
+            let ul = rich_decorations(&buffer, &rich, fonts)
+                .into_iter()
+                .find(|d| !d.background && d.run == 1)
+                .unwrap();
+            (g.x, g.w, ul.bounds.x, ul.bounds.width)
+        };
+        let (px, pw, pul_x, pul_w) = width_of(&mut fonts, [0.; 2]);
+        // Trail-only: 7pt after 'x'
+        let (tx, tw, tul_x, tul_w) = width_of(&mut fonts, [0., -8.]);
+        assert!(
+            (tx - px).abs() < 0.25,
+            "trail-only keeps glyph start: {px} {tx}"
+        );
+        assert!(
+            ((tw - pw) - 7.).abs() < 0.5,
+            "trail-only widens glyph advance by 7pt: {pw} -> {tw}"
+        );
+        assert!(
+            (tul_x - pul_x).abs() < 0.25 && (tul_w - pul_w).abs() < 0.5,
+            "trail-only trims underline back to text width: plain=({pul_x},{pul_w}) trail=({tul_x},{tul_w})"
+        );
+        // Combined lead (21pt) + trail (7pt) on a 1-char atom
+        let (cx, cw, cul_x, cul_w) = width_of(&mut fonts, [10.5, -8.]);
+        assert!(
+            (cx - px).abs() < 0.25,
+            "glyph box starts at lead edge: {px} {cx}"
+        );
+        assert!(
+            ((cw - pw) - 28.).abs() < 0.75,
+            "lead+trail widens glyph advance by 28pt: {pw} -> {cw}"
+        );
+        assert!(
+            ((cul_x - pul_x) - 21.).abs() < 0.75 && (cul_w - pul_w).abs() < 0.75,
+            "underline skips 21pt lead and 7pt trail: plain=({pul_x},{pul_w}) both=({cul_x},{cul_w})"
+        );
     }
 }

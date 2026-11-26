@@ -1532,7 +1532,8 @@ impl Ui {
         if !moving {
             state.scroll = None;
         } else if state.scroll.is_none() {
-            let now = Instant::now();
+            // On the interface's clock, as the steps that scroll it are.
+            let now = crate::clock::now();
             state.scroll = Some((now + Duration::from_millis(16), now));
         }
     }
@@ -2274,6 +2275,9 @@ impl Ui {
             && window_active.with_untracked(|was| *was != active)
         {
             window_active.set(active);
+        }
+        if self.window_is_active() != active {
+            crate::caret_blink::window_active_changed(self, active);
         }
         let changed = {
             let mut state = self.selection_state().borrow_mut();

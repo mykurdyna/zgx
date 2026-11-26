@@ -980,7 +980,7 @@ impl Live {
             Self::Fn(f) => vm
                 .call::<Value>(f, ())
                 .map(|v| crate::lower::number(&v))
-                .map_err(|e| vm.report(e))
+                .map_err(|e| vm.report_as(e, "a 3D property's function", f))
                 .unwrap_or(0.),
             Self::Driven(s, None) => s.get(),
             Self::Driven(s, Some((from, to))) => from + (to - from) * s.get(),
@@ -1014,7 +1014,7 @@ impl LiveVec {
                     crate::node::Readable::State(s) => s.get(),
                     crate::node::Readable::Function(f) => vm
                         .call::<Value>(f, ())
-                        .map_err(|e| vm.report(e))
+                        .map_err(|e| vm.report_as(e, "a 3D property's function", f))
                         .unwrap_or_default(),
                 };
                 let at = |i: usize| value.list().get(i).map(crate::lower::number).unwrap_or(0.);
@@ -1045,7 +1045,7 @@ impl LiveColor {
             Self::State(s) => value_color(&s.get(), theme),
             Self::Fn(f) => vm
                 .call::<Value>(f, ())
-                .map_err(|e| vm.report(e))
+                .map_err(|e| vm.report_as(e, "a 3D property's function", f))
                 .ok()
                 .and_then(|v| value_color(&v, theme)),
         };
@@ -1359,7 +1359,9 @@ pub(crate) fn lower(
             // Where it is now, as the camera's effect last set it (a target
             // the script moves included).
             controls.orbit = orbit.with_untracked(|o| *o);
-            let answer = controls.handle(&event.event, modifiers, crate::time::Instant::now());
+            // On the interface's clock: a flick's speed and whether it was
+            // held still before letting go, as its coast runs on frames.
+            let answer = controls.handle(&event.event, modifiers, zgx::clock::now());
             if answer.moved {
                 orbit.set(controls.orbit);
             }
@@ -1491,7 +1493,7 @@ fn hearing(
 /// Call a script's handler `f` with `arg`, in one batch, its error reported.
 fn call(vm: &Rc<Vm>, f: &Function, arg: mlua::Value) {
     vm.runtime.clone().batch(|| {
-        if let Err(error) = vm.call::<()>(f, arg) {
+        if let Err(error) = vm.call_as::<()>("a 3D event handler", f, arg) {
             vm.report(error);
         }
     });

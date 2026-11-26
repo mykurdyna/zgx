@@ -1269,12 +1269,15 @@ fn off_clock<R>(lua: &mlua::Lua, work: impl FnOnce(&zgx::reactive::Runtime) -> R
 pub(crate) fn install_editor(lua: &mlua::Lua, ui: &mlua::Table) -> mlua::Result<()> {
     type El<'a> = mlua::UserDataRef<ElementUd>;
     let editor_of = |e: &El| e.0.handle.get().and_then(NodeHandle::editor);
+    // Its text, atoms and undo on every target (the DOM's text area with
+    // atoms keeps a model of its own).
+    let edits_of = |e: &El| e.0.handle.get().and_then(NodeHandle::text_edits);
     let table = lua.create_table()?;
     table.set(
         "undo",
         lua.create_function(move |lua, e: El| {
             settle(lua);
-            let Some(editor) = editor_of(&e) else {
+            let Some(editor) = edits_of(&e) else {
                 return Ok(false);
             };
             let mut done = false;
@@ -1287,7 +1290,7 @@ pub(crate) fn install_editor(lua: &mlua::Lua, ui: &mlua::Table) -> mlua::Result<
         "redo",
         lua.create_function(move |lua, e: El| {
             settle(lua);
-            let Some(editor) = editor_of(&e) else {
+            let Some(editor) = edits_of(&e) else {
                 return Ok(false);
             };
             let mut done = false;
@@ -1300,14 +1303,14 @@ pub(crate) fn install_editor(lua: &mlua::Lua, ui: &mlua::Table) -> mlua::Result<
         "can_undo",
         lua.create_function(move |lua, e: El| {
             settle(lua);
-            Ok(editor_of(&e).is_some_and(|editor| editor.editor.borrow().can_undo()))
+            Ok(edits_of(&e).is_some_and(|editor| editor.can_undo()))
         })?,
     )?;
     table.set(
         "can_redo",
         lua.create_function(move |lua, e: El| {
             settle(lua);
-            Ok(editor_of(&e).is_some_and(|editor| editor.editor.borrow().can_redo()))
+            Ok(edits_of(&e).is_some_and(|editor| editor.can_redo()))
         })?,
     )?;
     table.set(
@@ -1329,13 +1332,14 @@ pub(crate) fn install_editor(lua: &mlua::Lua, ui: &mlua::Table) -> mlua::Result<
         lua.create_function(
             move |lua, (e, label, options): (El, String, Option<mlua::Table>)| {
                 settle(lua);
-                let Some(editor) = editor_of(&e) else {
+                let Some(editor) = edits_of(&e) else {
                     return Ok(None);
                 };
-                let (mut key, mut data, mut bg, mut range) =
-                    (None, crate::value::Value::Nil, None, None);
+                let (mut key, mut data, mut bg, mut range, mut name) =
+                    (None, crate::value::Value::Nil, None, None, None);
                 if let Some(options) = &options {
                     key = options.get::<Option<String>>("id")?;
+                    name = options.get::<Option<String>>("name")?;
                     data = options
                         .get::<Option<crate::value::Value>>("data")?
                         .unwrap_or_default();
@@ -1343,7 +1347,7 @@ pub(crate) fn install_editor(lua: &mlua::Lua, ui: &mlua::Table) -> mlua::Result<
                         bg = style.get::<Option<String>>("bg")?;
                     }
                     if let Some(replace) = options.get::<Option<mlua::Table>>("replace")? {
-                        let text = editor.editor.borrow().text().into_owned();
+                        let text = editor.text();
                         let from = replace.get::<Option<usize>>("from")?;
                         let to = replace.get::<Option<usize>>("to")?;
                         range = match (from, to) {
@@ -1360,7 +1364,12 @@ pub(crate) fn install_editor(lua: &mlua::Lua, ui: &mlua::Table) -> mlua::Result<
                 let wash = bg.as_deref().and_then(crate::node::parse_color);
                 let payload = crate::atoms::payload(key.clone(), &data, bg);
                 let made = off_clock(lua, |_| {
-                    editor.insert_atom(&label, range, wash, Some(payload))
+                    let id = editor.insert_atom(&label, range, wash, Some(payload))?;
+                    // What a reader reads for it instead of its text.
+                    if let Some(name) = name.filter(|name| !name.is_empty()) {
+                        editor.set_atom_name(id, Some(std::sync::Arc::from(name)));
+                    }
+                    Some(id)
                 })
                 .flatten();
                 settle(lua);
@@ -1373,10 +1382,10 @@ pub(crate) fn install_editor(lua: &mlua::Lua, ui: &mlua::Table) -> mlua::Result<
     table.set(
         "atoms",
         lua.create_function(move |lua, e: El| {
-            let Some(editor) = editor_of(&e) else {
+            let Some(editor) = edits_of(&e) else {
                 return Ok(None);
             };
-            let text = editor.editor.borrow().text().into_owned();
+            let text = editor.text();
             let list = crate::atoms::list(&editor.atoms(), |byte| {
                 crate::atoms::char_of_byte(&text, byte)
             });
@@ -1459,6 +1468,20 @@ impl UserData for ElementUd {
                 None => true,
             };
             Ok(e.0.handle.get().is_some_and(|h| h.focus_with(scroll)))
+        });
+        // How far a scroll view or list is scrolled and how far it can go:
+        // `{ offset, range, at_start, at_end }` along its axis, nil for
+        // anything else.
+        methods.add_method("scroll_info", |lua, e, ()| {
+            let Some((offset, range)) = e.0.handle.get().and_then(|h| h.scroll_extent()) else {
+                return Ok(None);
+            };
+            let info = lua.create_table()?;
+            info.set("offset", offset)?;
+            info.set("range", range)?;
+            info.set("at_start", offset <= 0.5)?;
+            info.set("at_end", offset >= range - 0.5)?;
+            Ok(Some(info))
         });
         // A list's row in view: `el:scroll_to_row(i, { align = "center" })`,
         // `i` from 1, `align` start, center, end or nearest (the default).

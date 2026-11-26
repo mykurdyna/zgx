@@ -590,6 +590,55 @@ export type HighlightSpan = {
 	strike: boolean?,
 	-- A wash behind it (inline code).
 	bg: Color?,
+	-- Its font size in points (a heading in a note): shapes its line.
+	size: number?,
+	-- Its line pitch in points: the line takes its runs' tallest.
+	line_height: number?,
+	-- A line under it (a link).
+	underline: boolean?,
+	-- `"mono"`: in the monospaced font (inline code); shapes its line.
+	font: "mono"?,
+}
+-- A textarea line's room (`line_insets`), in points: before its text (it
+-- wraps in what this leaves), above and below it; `hidden` takes the line
+-- and its room away (a closed toggle's lines). Lines sharing a `group`
+-- scroll sideways together (a code block's), shown from the first one's
+-- `left` to the area's edge; a `nowrap` line never wraps (the web's
+-- `white-space: pre`): shaped once at its full width, it scrolls with its
+-- group.
+export type LineInset = {
+	left: number?,
+	above: number?,
+	below: number?,
+	hidden: boolean?,
+	group: number?,
+	nowrap: boolean?,
+}
+-- A shape beside a textarea line (`line_marks`), in points from the line's
+-- left edge (its right with `from_right`) and from the top of its text:
+-- `w = "fill"` reaches the area's right edge, `h = "fill"` the line's
+-- bottom (less `bottom`). A list item's number is a `label`; `over_text`
+-- draws it over the text. A mark of a line in a scroll group moves with
+-- its text, cut to the group's frame, unless `pinned` (a code block's
+-- wash and line numbers stay still).
+export type LineMark = {
+	x: number?,
+	y: number?,
+	w: (number | "fill")?,
+	h: (number | "fill")?,
+	bottom: number?,
+	fill: Color?,
+	radius: number?,
+	border_color: Color?,
+	border_width: number?,
+	from_right: boolean?,
+	label: string?,
+	label_color: Color?,
+	label_size: number?,
+	mono: boolean?,
+	tabular: boolean?,
+	over_text: boolean?,
+	pinned: boolean?,
 }
 -- A number, or a number token: a standard one (`"$radius.md"`, see
 -- `NumberToken`) or an app's (`"$terminal.inset"`), hence any string.
@@ -974,6 +1023,26 @@ export type FolderPickerOptions = {
 -- A value to come (`ui.call`, `ui.fetch`, the file functions), of type
 -- `T`. Reads of its fields are tracked: what reads them follows it as it
 -- settles.
+-- What `ui.frames` measured: each frame's time from the start (ms), the
+-- start on `ui.now`'s clock, frames and those after a gap over 50 ms;
+-- `duration_ms` the second frame's time, `blocked_ms` the sum of the gaps
+-- over 50 ms, `settled_ms` the later of `duration_ms` and the last such
+-- gap's end (a sample cut short has `duration_ms` alone, if two frames
+-- came), each rounded; `capped` once `begin` reached 30 s.
+export type FrameSample = {
+	start_ms: number,
+	times: { number },
+	frames: number,
+	long_frames: number,
+	duration_ms: number?,
+	settled_ms: number?,
+	blocked_ms: number?,
+	capped: boolean?,
+}
+-- A gesture's measure (`ui.frames.begin`): `finish` ends it.
+declare extern type FrameMeasure with
+	function finish(self): Promise<FrameSample>
+end
 export type Promise<T = unknown> = {
 	-- It settled, with a value or an error.
 	done: boolean,
@@ -1212,6 +1281,10 @@ declare extern type Element with
 	-- list of measured rows measures those around it as it lands, so it
 	-- ends where asked. False for elements that are not lists.
 	function scroll_to_row(self, i: number, options: { align: ("start" | "center" | "end" | "nearest")? }?): boolean
+	-- How far a scroll view or list is scrolled along its axis and how far it
+	-- can go, in points: `at_start` and `at_end` say whether it rests at
+	-- that end, with no further to go. Nil for anything else.
+	function scroll_info(self): { offset: number, range: number, at_start: boolean, at_end: boolean }?
 	-- (Hidden until its API is settled.) The scroll views around it moved
 	-- so it shows, innermost first, as the web's scrollIntoView: `block`
 	-- down ("start" by default) and `inline` across ("nearest"), easing
@@ -1283,6 +1356,44 @@ declare extern type Ref with
 	-- Every mounted node sharing it, in document order.
 	function elements(self): { Element }
 end
+
+-- One control `ui.controls` lists, in window points.
+export type Control = {
+	-- ARIA's name for it: "button", "link", "checkbox", "menuitem", "tab", "dialog"…
+	role: string,
+	-- Its accessible name, else its text.
+	name: string,
+	-- The part of its box that shows.
+	x: number,
+	y: number,
+	w: number,
+	h: number,
+	disabled: boolean,
+	-- Nil where it cannot be selected, checked or opened. `checked`: a
+	-- checkbox, radio, switch, or a checked or radio menu item, on or off.
+	selected: boolean?,
+	checked: boolean?,
+	expanded: boolean?,
+	-- Pressed or not, a toggle button (`aria-pressed`); nil for any other.
+	pressed: boolean?,
+	-- What it opens, if anything: "dialog" or "menu".
+	haspopup: string?,
+	focused: boolean,
+	-- A menu's or list box's scroll view, when it has one: how far it is
+	-- scrolled and how far it can go, and whether it rests at either end,
+	-- with no further to go (`at_start`, `at_end`).
+	scroll_offset: number?,
+	scroll_range: number?,
+	at_start: boolean?,
+	at_end: boolean?,
+	-- Names it for `ui.press` while it is there.
+	handle: number,
+}
+
+export type ControlsOptions = {
+	-- At most this many, in order.
+	limit: number?,
+}
 
 export type ToastOptions = {
 	title: string | UiError,
@@ -1447,6 +1558,18 @@ export type CanvasTextOptions = {
 	-- `c:text`: a matrix { a, b, c, d, e, f } (x' = a x + c y + e,
 	-- y' = b x + d y + f) mapping the placed text, as a turned shape's.
 	transform: { number }?,
+}
+-- What `ui.measure_text` measures text in: a canvas text's font options,
+-- and the widest its lines may be (wrapped there).
+export type MeasureTextStyle = {
+	size: number?,
+	weight: number?,
+	italic: boolean?,
+	tabular: boolean?,
+	font: string?,
+	line_height: number?,
+	letter_spacing: number?,
+	max_w: number?,
 }
 -- How `c:image` fills its box, cuts its corners and fades it.
 export type CanvasImageOptions = {
@@ -1700,17 +1823,35 @@ export type CommandOptions = {
 	[number]: never,
 }
 
--- `ui.window { id, open = state, node }`: a window of the app's own (a
--- settings window), open while `open` is true; closing it sets `open` false.
--- Its node is its content. It shares the app's state.
-export type WindowOptions = {
-	read id: string,
+-- A glass's material (`ui.window`'s and zgx.json's `glass`): the platform's
+-- blur behind the window (macOS's `NSVisualEffectMaterial`; elsewhere the
+-- nearest the platform has).
+export type GlassMaterial =
+	"hud"
+	| "liquid"
+	| "under_window_background"
+	| "under_page_background"
+	| "window_background"
+	| "content_background"
+	| "titlebar"
+	| "header_view"
+	| "sidebar"
+	| "menu"
+	| "popover"
+	| "sheet"
+	| "tool_tip"
+	| "full_screen_ui"
+	| "selection"
+
+-- A window's keys: what `ui.window` takes besides its id, its `open` and its
+-- content, and what a platform's block (`macos`, `windows`, `linux`) may
+-- hold to replace them there.
+export type WindowKeys = {
 	-- Defaults to the id.
 	read title: string?,
 	-- Points; 480 by 360 by default.
 	read width: number?,
 	read height: number?,
-	read open: State<boolean>,
 	-- Its frame saved under this name as it moves and resizes, and reopened
 	-- where it was left (macOS).
 	read frame_autosave: string?,
@@ -1731,6 +1872,78 @@ export type WindowOptions = {
 	read min_height: number?,
 	read max_width: number?,
 	read max_height: number?,
+	-- The desktop blurred behind it: true (the HUD material), false, or a
+	-- material, `plain` for the blur alone (no tint or saturation of the
+	-- platform's).
+	read glass: (boolean | { read material: GlassMaterial?, read plain: boolean? })?,
+	-- The platform's own frame and title bar (true by default).
+	read decorations: boolean?,
+	-- Whether the person can resize it (true by default).
+	read resizable: boolean?,
+	-- See-through where nothing is drawn (false by default).
+	read transparent: boolean?,
+	-- The platform's shadow around it (true by default).
+	read shadow: boolean?,
+	-- Over the whole display, the menu bar and dock included (false by
+	-- default).
+	read covers_display: boolean?,
+	-- Where it sits among windows.
+	read level: ("normal" | "always_on_top")?,
+}
+
+-- `ui.window { id, open = state, node }`: a window of the app's own (a
+-- settings window), open while `open` is true; closing it sets `open` false.
+-- Its node is its content. It shares the app's state. A platform's block
+-- replaces its keys there, per key (a table such as `glass` whole):
+-- `macos = { decorations = true }`.
+export type WindowOptions = {
+	-- Defaults to the id.
+	read title: string?,
+	-- Points; 480 by 360 by default.
+	read width: number?,
+	read height: number?,
+	-- Its frame saved under this name as it moves and resizes, and reopened
+	-- where it was left (macOS).
+	read frame_autosave: string?,
+	-- AppKit's window tabs (macOS): as the user's setting says, always, or
+	-- never (a window with tabs of its own).
+	read tabbing: ("automatic" | "preferred" | "disallowed")?,
+	-- Where it opens: its top-left this far up and left of the pointer, as
+	-- `on_drag_outside`'s `{ e.grab_x, e.grab_y }` (a tab torn off stays
+	-- under the grab).
+	read under_pointer: { number }?,
+	-- False, or a state that is: made hidden, laid out and drawn meanwhile,
+	-- and shown whole as it turns true (on Wayland drawn as it shows).
+	read visible: (boolean | State<boolean>)?,
+	-- Its smallest and largest size in points, each width with its height.
+	-- The same for both: a window of fixed size, which a window manager can
+	-- still move (it refuses to move one that isn't resizable).
+	read min_width: number?,
+	read min_height: number?,
+	read max_width: number?,
+	read max_height: number?,
+	-- The desktop blurred behind it: true (the HUD material), false, or a
+	-- material, `plain` for the blur alone (no tint or saturation of the
+	-- platform's).
+	read glass: (boolean | { read material: GlassMaterial?, read plain: boolean? })?,
+	-- The platform's own frame and title bar (true by default).
+	read decorations: boolean?,
+	-- Whether the person can resize it (true by default).
+	read resizable: boolean?,
+	-- See-through where nothing is drawn (false by default).
+	read transparent: boolean?,
+	-- The platform's shadow around it (true by default).
+	read shadow: boolean?,
+	-- Over the whole display, the menu bar and dock included (false by
+	-- default).
+	read covers_display: boolean?,
+	-- Where it sits among windows.
+	read level: ("normal" | "always_on_top")?,
+	read id: string,
+	read open: State<boolean>,
+	read macos: WindowKeys?,
+	read windows: WindowKeys?,
+	read linux: WindowKeys?,
 	read [number]: Node | ((win: OwnWindow) -> Node),
 }
 
@@ -1812,6 +2025,17 @@ declare extern type WindowApi with
 	-- layout can't make (a sidebar collapsing to icons below a width).
 	-- Sizes themselves are layout's: percentages, `grow`, `max_w`.
 	size: State<{ width: number, height: number }>
+	-- Keep showing the window's frame while what it changes to comes (a
+	-- page opened before its content has arrived), for up to `ms`
+	-- milliseconds (at most 250), until `release_frames`: what changed
+	-- meanwhile then shows whole, in one frame, with no frame of the page
+	-- half there between. Asked again before a frame is drawn, it still
+	-- ends 250 ms after the first. Input still arrives and scripts still
+	-- run; a window resized meanwhile shows its frame at the new size. It
+	-- does nothing before the window's first frame. The app's own window
+	-- only.
+	hold_frames: (ms: number) -> ()
+	release_frames: () -> ()
 	function __call(self, opts: WindowOptions): ()
 end
 
@@ -9374,12 +9598,29 @@ export type InputProps = {
 	-- before left (0 before the first), it returns spans `{ from, to,
 	-- color }` (bytes counted from 1, as `string.find` gives them; `color`
 	-- a colour or `"$token"`, or left out) with `weight`, `italic`,
-	-- `strike` and `bg` by name (`HighlightSpan`), and what the line leaves
+	-- `strike`, `bg`, `size`, `line_height`, `underline` and `font` by
+	-- name (`HighlightSpan`), and what the line leaves
 	-- the next (a block comment or string running on: any value, a
 	-- number, a string, a table; the same string or number is the same
 	-- state, a table the same one only as itself). It must depend on
 	-- nothing but its arguments.
 	highlight: ((line: string, state: any) -> ({ HighlightSpan }?, any))?,
+	-- Several lines only: a line's room (`LineInset`): a list item's
+	-- indent, a heading's or a quote's space above and below. Given the
+	-- line and the state `highlight` was given for it (0 without one), so
+	-- a fenced block's lines know they're inside it. Asked once for each
+	-- line text and state, it must depend on nothing but its arguments.
+	-- An editor without it lays out as before.
+	line_insets: ((line: string, state: any) -> LineInset?)?,
+	-- Shapes beside each line (a quote's rule, a code block's wash, a list
+	-- item's number), given the line and the state `highlight` was given
+	-- for it. Asked once for each line text and state (and theme), it must
+	-- depend on nothing but its arguments.
+	line_marks: ((line: string, state: any) -> { LineMark }?)?,
+	-- Several lines only: its scroll groups (a `LineInset`'s `group`, a
+	-- code block's) show the scrollbar scroll views do, across the bottom
+	-- of the one that moved last.
+	group_scrollbar: boolean?,
 	-- Several lines only: ranges of the whole text marked behind it (a
 	-- search's matches), `{ { from, to, color? }, … }` in bytes counted
 	-- from 1; only those in view are drawn.
@@ -9409,11 +9650,14 @@ export type InputProps = {
 	-- The first line in view, from 1, whenever it changes: an outline following
 	-- the text.
 	on_top_line: ((line: number) -> ())?,
-	-- Its atoms (chips): ranges of the text that edit as one unit, `{ id,
+	-- Its atoms (chips): ranges of the text that edit as one unit (a caret
+	-- goes to one's nearer edge, a selection into one takes it whole), `{ id,
 	-- from, to, data?, style? }` each, `from` and `to` in characters from 0
 	-- (half-open), by `from`. Two-way, as `value` is: the editor writes it as
 	-- they are made, lost or moved, and setting it restores them (a draft's;
-	-- set the text first). The label stays in the text.
+	-- set the text first). The label stays in the text. A copy or a cut
+	-- puts them on the clipboard beside it, and a paste into a textarea with
+	-- `atoms` makes them again (a new `id` where its name is taken there).
 	atoms: State<{ AtomItem }>?,
 	-- Told after atoms are made, lost or moved (an edit, an undo): what was
 	-- added and removed (a removed one with its `label` and the range it had),
@@ -9442,10 +9686,26 @@ export type AtomLook = {
 	color: Color?,
 	weight: number?,
 	underline: (boolean | { color: Color?, offset: number? })?,
-	icon: { src: string?, code: string?, size: number?, gap: number?, tint: Color? }?,
+	-- `bg`, `radius` and `pad`: a rounded well behind the icon, `pad`
+	-- points around it.
+	icon: {
+		src: string?,
+		code: string?,
+		size: number?,
+		gap: number?,
+		tint: Color?,
+		bg: Color?,
+		radius: number?,
+		pad: number?,
+	}?,
 	-- Its text shown as a picture instead (an equation), sized in EM of the
 	-- textarea's text: one caret unit, its text kept for copy and search.
 	svg: { src: string?, code: string?, width: number, height: number, descent: number? }?,
+	-- Room inside its wash, in points: `x` on both sides, `{ x, y }`, or
+	-- `{ left, right, y }`; `y` hugs the wash around the text.
+	padding: (number | { number })?,
+	-- The corners of its wash, in points.
+	radius: number?,
 }
 export type AtomItem = {
 	id: string?,
@@ -9453,6 +9713,9 @@ export type AtomItem = {
 	to: number,
 	data: any?,
 	style: AtomLook?,
+	-- What assistive technology reads for it instead of its text (a
+	-- mention's full name); either way it is read as one unit.
+	name: string?,
 	-- Only on a removed atom: the text it had.
 	label: string?,
 }
@@ -9466,6 +9729,8 @@ export type InsertAtomOptions = {
 	id: string?,
 	data: any?,
 	style: { bg: string? }?,
+	-- What assistive technology reads for it instead of its text.
+	name: string?,
 	-- The characters it takes the place of (the `@que` typed to ask for it).
 	replace: { from: number, to: number }?,
 }
@@ -20884,6 +21149,9 @@ export type SubmenuProps = {
 	-- label, a value, a chevron); the label and a "›" otherwise. It opens
 	-- when the pointer moves onto it.
 	trigger: Node?,
+	-- Where it opens beside its trigger (side, alignment, offset). Without
+	-- one, it opens beside the trigger with the default submenu offset.
+	placement: Placement?,
 }
 export type WebViewProps = {
 	-- Size and position.
@@ -21816,6 +22084,460 @@ export type TerminalProps = {
 	context_menu_open: Props_context_menu_open,
 	[number]: never,
 	term: Term,
+}
+-- The name the host registered with `zgx_script::host_view`.
+export type HostViewProps = {
+	-- Size and position.
+	w: Props_w,
+	h: Props_h,
+	size: Props_size,
+	min_w: Props_min_w,
+	max_w: Props_max_w,
+	min_h: Props_min_h,
+	max_h: Props_max_h,
+	w_full: Props_w_full,
+	h_full: Props_h_full,
+	aspect: Props_aspect,
+	absolute: Props_absolute,
+	relative: Props_relative,
+	top: Props_top,
+	left: Props_left,
+	inset_start: Props_inset_start,
+	inset_end: Props_inset_end,
+	right: Props_right,
+	bottom: Props_bottom,
+	-- Spacing.
+	p: Props_p,
+	px: Props_px,
+	py: Props_py,
+	pt: Props_pt,
+	pr: Props_pr,
+	pb: Props_pb,
+	pl: Props_pl,
+	ps: Props_ps,
+	pe: Props_pe,
+	m: Props_m,
+	mx: Props_mx,
+	my: Props_my,
+	mt: Props_mt,
+	mr: Props_mr,
+	mb: Props_mb,
+	ml: Props_ml,
+	ms: Props_ms,
+	me: Props_me,
+	gap: Props_gap,
+	gap_x: Props_gap_x,
+	gap_y: Props_gap_y,
+	-- Flex and grid.
+	direction: Props_direction,
+	dir: Props_dir,
+	grow: Props_grow,
+	shrink: Props_shrink,
+	basis: Props_basis,
+	flex_wrap: Props_flex_wrap,
+	wrap_reverse: Props_wrap_reverse,
+	items: Props_items,
+	justify: Props_justify,
+	self: Props_self,
+	content: Props_content,
+	grid: Props_grid,
+	display: Props_display,
+	cols: Props_cols,
+	rows: Props_rows,
+	areas: Props_areas,
+	flow: Props_flow,
+	area: Props_area,
+	grid_column: Props_grid_column,
+	grid_row: Props_grid_row,
+	col_start: Props_col_start,
+	row_start: Props_row_start,
+	col_span: Props_col_span,
+	row_span: Props_row_span,
+	col_span_full: Props_col_span_full,
+	row_span_full: Props_row_span_full,
+	overflow: Props_overflow,
+	overflow_x: Props_overflow_x,
+	overflow_y: Props_overflow_y,
+	z: Props_z,
+	-- Inside a scroll view, hold this far below its top as it scrolls past,
+	-- inside the parent (CSS's `position: sticky` with `top`).
+	sticky_top: Props_sticky_top,
+	hidden: Props_hidden,
+	invisible: Props_invisible,
+	-- Paint.
+	bg: Props_bg,
+	gradient: Props_gradient,
+	radial: Props_radial,
+	mask_gradient: Props_mask_gradient,
+	mask_radial: Props_mask_radial,
+	text_gradient: Props_text_gradient,
+	text_radial: Props_text_radial,
+	color: Props_color,
+	bg_image: Props_bg_image,
+	bg_fit: Props_bg_fit,
+	rounded: Props_rounded,
+	corners: Props_corners,
+	rounded_tl: Props_rounded_tl,
+	rounded_tr: Props_rounded_tr,
+	rounded_br: Props_rounded_br,
+	rounded_bl: Props_rounded_bl,
+	border: Props_border,
+	border_sides: Props_border_sides,
+	border_color: Props_border_color,
+	border_over: Props_border_over,
+	-- A function may return nil: a solid border.
+	border_dash: Props_border_dash,
+	border_style: Props_border_style,
+	outline: Props_outline,
+	outline_color: Props_outline_color,
+	outline_offset: Props_outline_offset,
+	outline_style: Props_outline_style,
+	outline_dash: Props_outline_dash,
+	shadow: Props_shadow,
+	text_shadow: Props_text_shadow,
+	drop_shadow: Props_drop_shadow,
+	inset_shadow: Props_inset_shadow,
+	opacity: Props_opacity,
+	brightness: Props_brightness,
+	contrast: Props_contrast,
+	saturate: Props_saturate,
+	hue_rotate: Props_hue_rotate,
+	sepia: Props_sepia,
+	invert: Props_invert,
+	blend: Props_blend,
+	blur: Props_blur,
+	backdrop_blur: Props_backdrop_blur,
+	fade: Props_fade,
+	fade_x: Props_fade_x,
+	fade_sides: Props_fade_sides,
+	fade_overflow: Props_fade_overflow,
+	snap: Props_snap,
+	zoom: Props_zoom,
+	zoom_fixed: Props_zoom_fixed,
+	clip_inset: Props_clip_inset,
+	clip_feather: Props_clip_feather,
+	layer: Props_layer,
+	object_position: Props_object_position,
+	fit: Props_fit,
+	image_rendering: Props_image_rendering,
+	slice: Props_slice,
+	tint: Props_tint,
+	decode: Props_decode,
+	dither: Props_dither,
+	characters: Props_characters,
+	cursor: Props_cursor,
+	-- Text.
+	text_size: Props_text_size,
+	weight: Props_weight,
+	bold: Props_bold,
+	italic: Props_italic,
+	align: Props_align,
+	font: Props_font,
+	wrap: Props_wrap,
+	truncate: Props_truncate,
+	lines: Props_lines,
+	line_height: Props_line_height,
+	letter_spacing: Props_letter_spacing,
+	-- Tabular figures: every digit the same width.
+	tabular: Props_tabular,
+	-- OpenType features (CSS's `font-feature-settings`): "ss01 cv02=3 liga=0",
+	-- a tag on, or `tag=value` (0 off). Replaces `tabular`: give "tnum" here too.
+	font_features: Props_font_features,
+	-- Underlined text (inherited, as CSS's `text-decoration`), and how far
+	-- below the baseline the line sits.
+	underline: Props_underline,
+	underline_offset: Props_underline_offset,
+	-- The language its text is in (HTML's `lang`, a BCP 47 tag: "ja",
+	-- "zh-TW"), inherited: Han characters take its fonts (a Chinese quote's
+	-- in a Japanese app), over the app's locale and a line's kana, and
+	-- assistive technology reads it in that language.
+	lang: Props_lang,
+	-- Its rounded box, where it is each frame, read by layer shaders asking
+	-- for this tag (`ui.layer_shader(src, { geometry = "tag" })`).
+	geometry: Props_geometry,
+	-- Transforms: after layout, about `origin` (fractions of the node).
+	x: Props_x,
+	y: Props_y,
+	scale: Props_scale,
+	scale_x: Props_scale_x,
+	scale_y: Props_scale_y,
+	rotate: Props_rotate,
+	skew: Props_skew,
+	skew_x: Props_skew_x,
+	skew_y: Props_skew_y,
+	rotate_x: Props_rotate_x,
+	rotate_y: Props_rotate_y,
+	perspective: Props_perspective,
+	origin: Props_origin,
+	-- The subtree's theme: a theme's name (`"zgx-light"`), or tokens to
+	-- override (`{ accent = "#e5484d" }`, with `theme = name` to start from).
+	theme: Props_theme,
+	-- Values the components and rows built in this subtree read with
+	-- `ui.use_context(name)`, as React's context gives them: a state, a
+	-- table, a function. Nearer ones win.
+	provide: Props_provide,
+	-- Identity, for selectors, refs and animations.
+	id: Props_id,
+	-- Space-separated class names.
+	class: Props_class,
+	-- Styles chosen from a `ui.variants` definition: `button { tone =
+	-- "ghost" }`, or the recipe itself for its defaults. The element's own
+	-- properties win over them.
+	variants: Props_variants,
+	ref: Props_ref,
+	focusable: Props_focusable,
+	-- `false`: a press on it (or anything inside it) leaves focus where it
+	-- is, as the web's `mousedown` with `preventDefault()`; its clicks still
+	-- come. A list hanging from a field: its rows and tabs take clicks, the
+	-- field keeping the keys and its caret.
+	focus_on_press: Props_focus_on_press,
+	-- While focus is in it, every key goes to what is focused: no shortcut
+	-- or menu item takes one (a field recording a shortcut). As focus
+	-- leaves, shortcuts work again.
+	capture_keys: Props_capture_keys,
+	-- What assistive technology takes it for (ARIA's `role`), instead of
+	-- what it is: a clickable row as an "option", a row of buttons as a
+	-- "toolbar". It keeps what it does.
+	role: Props_role,
+	-- A section title of this level, 1 to 6 (`h1`…`h6`): screen readers
+	-- list headings and move between them.
+	heading: Props_heading,
+	-- Internal, subject to change: a tree item's depth, 1 for the top
+	-- (`aria-level`), as virtualised rows are flat siblings a reader can't
+	-- infer it from. A state or function is followed: a row moved into
+	-- another branch is read at its new depth without a rebuild.
+	level: Props_level,
+	-- Whether this option, tab or item is the chosen one (`aria-selected`).
+	selected: Props_selected,
+	-- Whether a switch, checkbox or radio of the app's own is on
+	-- (`aria-checked`), and whether what a control opens shows
+	-- (`aria-expanded`): a custom disclosure's.
+	checked: Props_checked,
+	expanded: Props_expanded,
+	-- Whether a toggle button of the app's own is pressed (`aria-pressed`):
+	-- a toolbar's bold. It reads as a toggle button with its state.
+	pressed: Props_pressed,
+	-- Announce changes to the text in it (`aria-live`): a count, a "Sent"
+	-- note, a message arriving.
+	live: Props_live,
+	-- Read after its name, as a hint (`aria-description`); a state or a
+	-- function follows what it says (a sheet grabber's "expand" or "collapse").
+	description: Props_description,
+	-- What it reads as besides its name (`aria-valuetext`): a slider's value
+	-- in words, or any element's, as a Settings row's detail.
+	value_text: Props_value_text,
+	-- What is wrong with its value (`aria-invalid`), followed: nil while it
+	-- is fine. Assistive technology hears it with the field.
+	error: Props_error,
+	-- Left out of the accessibility tree with what it holds (`aria-hidden`):
+	-- decoration, or what is said elsewhere.
+	aria_hidden: Props_aria_hidden,
+	-- While it shows, assistive technology reads it alone, not what lies behind
+	-- it (aria-modal): a sheet or dialog the app builds itself.
+	aria_modal: Props_aria_modal,
+	-- One Tab stop for the focusable things inside; the arrows along this
+	-- axis (and Home, End) move among them, as ARIA's composite widgets
+	-- behave. `role = "listbox"` is vertical, "toolbar" and "tablist"
+	-- horizontal, without asking.
+	focus_group: Props_focus_group,
+	-- A press on it (or on what inside takes no input) moves the window; a
+	-- double click zooms it. Buttons and inputs inside keep their clicks.
+	-- CSS pointer-events: "none" (or false) lets the pointer through to what
+	-- is under the node (presses, hover, the wheel, drops, a native view);
+	-- descendants with handlers still take it. A state or function follows.
+	pointer_events: Props_pointer_events,
+	-- "target": while `x`, `y`, `scale`, `rotate` or `opacity` animate
+	-- (`ui.tween`, `ui.spring`, `anime`) or a layout animation moves it, it and what
+	-- it holds take clicks and hover where they're going, not where they
+	-- show. "shown" (the default) hits where it shows.
+	hit: Props_hit,
+	window_drag: Props_window_drag,
+	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares. `false` keeps every plugin off the
+	-- element (a password field, a destructive confirm), as `private` does.
+	hook: Props_hook,
+	private: Props_private,
+	-- The pointer selects the text in it and everything it holds, as on a
+	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
+	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
+	selectable: Props_selectable,
+	-- A selectable node's highlight and selected-text colours (CSS
+	-- `::selection`), over the theme's `$selection` and `$selection.text`
+	-- tokens; a state or function follows.
+	selection_color: Props_selection_color,
+	selected_text_color: Props_selected_text_color,
+	selection_radius: Props_selection_radius,
+	-- Shown over it while the pointer rests on it (after 300 ms; at once
+	-- within a second of another): text in the theme's look, or a node of
+	-- the app's own. Above it, centred, unless `tooltip_placement` says.
+	tooltip: Props_tooltip,
+	tooltip_placement: Props_tooltip_placement,
+	-- A hover card the pointer can move into and click in: it stays while
+	-- the pointer is over the node or the card.
+	tooltip_interactive: Props_tooltip_interactive,
+	-- Milliseconds the pointer rests before it shows (300; once one
+	-- shows, the next shows at once). Keyboard focus shows it too.
+	tooltip_delay: Props_tooltip_delay,
+	-- A condition (true disables), or the styles it shows while disabled.
+	disabled: Props_disabled,
+	-- Internal, subject to change: whether it looks disabled (a control is
+	-- dimmed while disabled unless it styles itself). `false` keeps it as it
+	-- is; a state or function decides as it changes (a sending button stays
+	-- disabled but keeps its ink). It stays disabled to input and assistive
+	-- technology either way.
+	dim: Props_dim,
+	hover: Props_hover,
+	active: Props_active,
+	focus: Props_focus,
+	-- Its descendants' `queries` read its size, as CSS's `container-type`.
+	-- Its content doesn't size its width: give it one, a percentage or
+	-- `grow`, or let its parent stretch it.
+	container: Props_container,
+	-- Styles while the container above is within bounds, as CSS
+	-- `@container` rules, in order (the last that holds wins): `{ {
+	-- min_width = 900, style = { hidden = false } } }`. They follow its size
+	-- as layout changes it, in that frame, without running the script.
+	queries: Props_queries,
+	-- Size animation ("height", "width", "size"; `true` is "height") or
+	-- position animation ("position"). A `layout_id` node mounting as
+	-- another with the same id unmounts (or while it is mounted) moves and
+	-- scales from that one's box.
+	layout: Props_layout,
+	layout_id: Props_layout_id,
+	layout_ease: Props_layout_ease,
+	-- Milliseconds.
+	layout_duration: Props_layout_duration,
+	layout_enter: Props_layout_enter,
+	layout_clip: Props_layout_clip,
+	-- The content shows through the bitmap's alpha: `mask = bitmap`, or
+	-- `{ bitmap, w = …, h = …, x = …, y = …, sweep = … }`.
+	mask: Props_mask,
+	bg_shader: Props_bg_shader,
+	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
+	shader_params: Props_shader_params,
+	-- The subtree, cached as a layer, composites through it: each pixel of
+	-- the box passes through its `layer` function.
+	layer_shader: Props_layer_shader,
+	-- Up to four vec4s: lists of numbers, or colors (0 to 1).
+	layer_params: Props_layer_params,
+	-- How many points past the box the layer shader paints (a glow, a ripple): cut by the clips around the node, not its own.
+	layer_bleed: Props_layer_bleed,
+	-- How many points past the box and bleed its `zgx_backdrop(p)` reads.
+	layer_reach: Props_layer_reach,
+	-- The engine steps the layer shader's time on the frame clock while the node shows and it's not reduced motion: no script per step.
+	layer_clock: Props_layer_clock,
+	-- The same for a `bg_shader`'s time.
+	shader_clock: Props_shader_clock,
+	-- While false: no layer shader, no layer, no clock.
+	layer_on: Props_layer_on,
+	-- Events.
+	on_click: Props_on_click,
+	-- What plays on the `ui` bus as it's activated (a press, Enter or --@audio
+	-- Space, assistive technology's), before `on_click` (zgx-script's --@audio
+	-- `audio` feature). --@audio
+	sound: Props_sound, --@audio
+	-- Primary pointer down and up.
+	on_press: Props_on_press,
+	on_release: Props_on_release,
+	-- The middle (or another extra) button pressed and released on it: a
+	-- browser tab closes on it, a link opens in the background.
+	on_aux_click: Props_on_aux_click,
+	-- The primary button clicked twice on one spot, as the DOM's `dblclick`.
+	on_double_click: Props_on_double_click,
+	-- Back or forward on the platform's gesture over it (a trackpad's swipe
+	-- between pages, where nothing under the fingers scrolls that way).
+	on_navigate: Props_on_navigate,
+	-- On a `selectable` region: what a copy out of it (⌘C, the Edit menu,
+	-- its context menu) puts on the clipboard. Handed the selection's text
+	-- and HTML and, for each text node it spans in order, the id of the
+	-- element it is in (`false` for none); returns `{ text, html, types }`, or nil
+	-- for the selection's own.
+	on_copy: Props_on_copy,
+	-- Files dropped on it from outside the window (Finder, Explorer): the
+	-- innermost node with one takes them.
+	on_file_drop: Props_on_file_drop,
+	-- Files dragged from outside the window come over it (true), then
+	-- leave, are dropped or the drag ends (false).
+	on_file_hover: Props_on_file_hover,
+	on_hover: Props_on_hover,
+	on_pointer_move: Props_on_pointer_move,
+	-- It took the pointer's lock (`el:lock_pointer()`: true) or lost it
+	-- (false): let go, Escape, the window losing focus, or another took it.
+	on_pointer_lock: Props_on_pointer_lock,
+	-- Return true to consume the key.
+	on_key: Props_on_key,
+	on_key_up: Props_on_key_up,
+	on_focus: Props_on_focus,
+	on_blur: Props_on_blur,
+	-- Return true to take the gesture from the scroll views around it.
+	on_wheel: Props_on_wheel,
+	on_pinch: Props_on_pinch,
+	-- Its zoom, bound to this state: Control-wheel or a pinch over it zooms it (0.25 to 5).
+	zoomable: Props_zoomable,
+	on_mount: Props_on_mount,
+	-- When layout gives it a new size, and at its first layout.
+	on_resize: Props_on_resize,
+	-- When any of it comes into view or all of it leaves (inside every
+	-- clip and scroll viewport above it), and at its first layout: for
+	-- building what only matters on screen. Told once a frame, before
+	-- paint, as an IntersectionObserver: a handler in the same frame reads
+	-- the frame before's; an element's `x`, `y`, `width` and `height` are
+	-- read fresh.
+	on_visible: Props_on_visible,
+	-- With `on_visible`: in view once any of it comes within this many
+	-- points of showing (an IntersectionObserver's `rootMargin`), to build
+	-- what is about to scroll in before it does.
+	visible_margin: Props_visible_margin,
+	-- Drag and drop within the window. Payloads are what `on_drag`
+	-- returns: the script's own plain values, so they are `any` here.
+	-- A source: `on_drag` returns the payload once the pointer moves 4
+	-- points; `drag_preview` builds what follows the pointer.
+	on_drag: Props_on_drag,
+	drag_preview: Props_drag_preview,
+	-- Where the preview goes: its point `drag_preview_anchor` (fractions
+	-- of its size, `{ 0.5, 0 }` its top middle) `drag_preview_offset`
+	-- points from the pointer. `{ 0.5, 0 }` and `{ 0, 16 }` hang it below
+	-- the pointer, leaving what the drag is over in view; without either,
+	-- it keeps the grab point under the pointer.
+	drag_preview_anchor: Props_drag_preview_anchor,
+	drag_preview_offset: Props_drag_preview_offset,
+	on_drag_end: Props_on_drag_end,
+	-- What the drag carries to other apps as it leaves the window (macOS):
+	-- Finder takes files, Mail text, a browser links.
+	drag_export: Props_drag_export,
+	-- Released outside every window of the app (macOS): a tab torn off its
+	-- window. `grab_x`/`grab_y` are where the source was held.
+	on_drag_outside: Props_on_drag_outside,
+	-- The drag moves its window instead, with no preview (macOS): a
+	-- window's only tab. Dropped on another window's destination it drops
+	-- there; elsewhere the window stays where it was let go.
+	drag_moves_window: Props_drag_moves_window,
+	-- A destination: `drop_when` filters payloads (default: all).
+	drop_when: Props_drop_when,
+	on_drag_over: Props_on_drag_over,
+	on_drag_leave: Props_on_drag_leave,
+	on_drop: Props_on_drop,
+	-- Spring-loading: an accepted drag has rested on it for the system's
+	-- delay (0.5 s by default), or Space was pressed. Open what it stands
+	-- for (show a tab); return `false` to decline. Once per stay.
+	on_drag_spring: Props_on_drag_spring,
+	-- A secondary click (control-click on macOS) shows the returned
+	-- `menu_item`s, `submenu`s and separators as a menu at the pointer;
+	-- returning nil (or nothing) shows none.
+	context_menu: Props_context_menu,
+	-- The context menu panel's look: bg, rounded, p, gap, backdrop_blur,
+	-- border, shadow, w, …
+	context_menu_style: Props_context_menu_style,
+	-- Open the context menu under the node, from its left edge (a tab's),
+	-- rather than at the pointer.
+	context_menu_below: Props_context_menu_below,
+	-- Internal, subject to change: kept saying whether its context menu
+	-- shows (true as it opens; false as it closes, however it does: Escape,
+	-- a pick, a click outside, Tab, the window losing focus). Written false,
+	-- the menu closes: a floating panel hides while the menu shows.
+	context_menu_open: Props_context_menu_open,
+	[number]: never,
+	name: string,
 }
 -- `from`: only what that plugin (by name) contributes.
 export type SlotProps = {
@@ -23356,6 +24078,13 @@ declare ui: {
 	-- Call `fn` once, after `ms` milliseconds (0: before the next frame is drawn); returns a
 	-- function that cancels it.
 	after: (ms: number, fn: () -> ()) -> () -> (),
+	-- How smoothly the app's frames came: `measure` runs `fn` and records
+	-- for `window_ms` (1000) after it, as the web's rAF measures a switch;
+	-- `begin` records until `finish` (a gesture), 30 s at most.
+	frames: {
+		measure: (fn: () -> (), opts: { window_ms: number? }?) -> Promise<FrameSample>,
+		begin: () -> FrameMeasure,
+	},
 	column: (props: ContainerProps?) -> Node,
 	row: (props: ContainerProps?) -> Node,
 	div: (props: ContainerProps?) -> Node,
@@ -23389,6 +24118,8 @@ declare ui: {
 	-- page for `id`, made with `opts` the first time, kept across reloads.
 	web: ((opts: WebOptions?) -> Web) & ((id: string, opts: WebOptions?) -> Web),
 	terminal: (props: TerminalProps) -> Node,
+	-- A view the host made in Rust, mounted in this tree under its popups.
+	host_view: (props: HostViewProps) -> Node,
 	-- The session for `id`, started the first time; `ui.term(id)` without
 	-- options only looks it up.
 	term: (id: string, opts: TermOptions?) -> Term,
@@ -23563,6 +24294,16 @@ declare ui: {
 	-- A host function's value, now (`ScriptHost::function`): a read of data the
 	-- host keeps, so large data is never copied into the script whole.
 	call_sync: (name: string, arg: unknown?) -> any,
+	-- A native module the app loaded (`ScriptHost::load_module`), as a table
+	-- of its functions, each called with its own arguments:
+	-- `ui.module("words").count(text)`. `zgx types` gives each module the
+	-- app's `zgx.json` names its own type here. The app's own scripts only.
+	module: (name: string) -> any,
+	-- A native module's line highlighter (`zgx_module::Host::highlighter`;
+	-- unstable), for a textarea's `highlight`: called with no script between,
+	-- its kinds coloured as `colours` says (`{ keyword = "$accent" }`). The
+	-- app's own scripts only.
+	highlighter: (name: string, colours: { [string]: string }?) -> any,
 	-- Call a host action for its result (`ScriptHost::async_action`; a
 	-- plain action settles at once with nil): a promise of what it returns.
 	call: (name: string, arg: unknown?) -> Promise,
@@ -23654,10 +24395,14 @@ declare ui: {
 	-- image is decoded and encoded off the main thread. `write` takes
 	-- `{ text, html?, types? }` too: HTML and types of the app's own beside
 	-- the text in one change, which `read_type` reads back (a web page's
-	-- copy's types too, in Chrome, Edge and Electron apps).
+	-- copy's types too, in Chrome, Edge and Electron apps). With `image`
+	-- (a PNG's bytes) too, the image goes beside them in the same change,
+	-- and `write` is a promise (Windows' copy decodes it off the main
+	-- thread).
 	clipboard: {
 		read: () -> string?,
-		write: (content: string | { text: string, html: string?, types: { [string]: string }? }) -> boolean,
+		write: ((content: string | { text: string, html: string?, types: { [string]: string }? }) -> boolean)
+			& ((content: { text: string, html: string?, types: { [string]: string }?, image: string }) -> Promise<boolean>),
 		read_type: (mime: string) -> string?,
 		read_html: () -> string?,
 		write_html: (text: string, html: string) -> boolean,
@@ -23754,6 +24499,20 @@ declare ui: {
 	-- A toast in the window's corner: it goes after `duration` ms (5000;
 	-- 7000 a warning; an error stays), or at its ×. Returns its id.
 	toast: (opts: ToastOptions) -> number,
+	-- The controls on screen, in document order with popups and modals last
+	-- (a plain group, a text, a scroll view or a table's rows are not
+	-- controls). Nothing is built until you ask. `{}` where the host gave
+	-- no window; an error in a plugin. Under a host's guard, only those the
+	-- script mounted.
+	controls: (opts: ControlsOptions?) -> { Control },
+	-- Presses and releases the primary button at the middle of the control
+	-- `handle` names, as `zgx inspect click` does. False, doing nothing,
+	-- for a handle whose control is gone, hidden or covered; an error under
+	-- a host's guard for a control the script didn't mount.
+	press: (handle: number) -> boolean,
+	-- The text a control (`ui.controls`' `handle`) shows, a word apart, at most
+	-- `cap` (400) characters; "" once it is gone. A dialog's, for a notice.
+	text_of: (handle: number, cap: number?) -> string,
 	dismiss_toast: (id: number) -> (),
 	-- JSON: `encode(value, { pretty = true })` writes what state could hold
 	-- (lists as arrays, tables as objects, `ui.null` as null); `decode(text)`
@@ -23779,6 +24538,10 @@ declare ui: {
 	-- `width * scale` by `height * scale` pixels, `x`, `y` at its top left.
 	-- (nil with `file`; a `RenderedFile` with `file` and `append`.)
 	render_canvas: (draw: (c: Canvas, w: number, h: number) -> (), opts: RenderCanvasOptions) -> Promise<any>,
+	-- The points `text` takes in `style` (a canvas text's options: size,
+	-- font, weight, italic, tabular, line_height, letter_spacing), wrapped
+	-- at `max_w` if given, as the app lays text out; nothing is mounted.
+	measure_text: (text: string, style: MeasureTextStyle?) -> { w: number, h: number },
 	-- Out from (`cx`, `cy`) to radius `r` (`ry` down, for an ellipse), the
 	-- last colour past it; `transform` ({ a, b, c, d, e, f }) maps it after.
 	radial: (cx: number, cy: number, r: number, colors: { read [number]: Color }, opts: GradientOptions?) -> Brush,

@@ -30,6 +30,10 @@ use crate::time::Instant;
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use zgx::{
@@ -188,6 +192,19 @@ impl FakeDesktop {
         *self.files.borrow_mut() = files;
     }
 }
+/// `png` decoded, as a desktop's clipboard holds a copied image: by zgx-gpu,
+/// which a browser build doesn't link (none there: its copy is refused).
+fn decoded(png: &[u8]) -> Option<std::sync::Arc<zgx::image::ImageData>> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        zgx_gpu::assets::decode_image(png).ok()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = png;
+        None
+    }
+}
 impl zgx::platform::Platform for FakeDesktop {
     fn open_url(&self, url: &str) -> bool {
         self.opened.borrow_mut().push(url.to_string());
@@ -254,6 +271,21 @@ impl zgx::platform::Platform for FakeDesktop {
         *self.html.borrow_mut() = None;
         self.types.borrow_mut().clear();
         self.image_only.set(true);
+        Box::pin(async { true })
+    }
+    fn set_clipboard_typed_image(
+        &self,
+        text: String,
+        html: Option<String>,
+        types: &[(String, String)],
+        png: std::sync::Arc<[u8]>,
+    ) -> zgx::platform::Pending<bool> {
+        // The text, HTML, types and image of one copy, side by side.
+        let Some(image) = decoded(&png) else {
+            return Box::pin(async { false });
+        };
+        self.copy_typed(text, html, types.to_vec());
+        *self.image.borrow_mut() = Some(image);
         Box::pin(async { true })
     }
     fn open_files(
@@ -348,6 +380,9 @@ pub struct TestApp {
     pub natives: zgx::native_view::NativeViews,
     /// Its clipboard and file dialogs, made with [`TestApp::with_desktop`].
     pub desktop: Option<Rc<FakeDesktop>>,
+    /// How many times its tasks asked a window's event loop to wake
+    /// ([`TestApp::wakes`]).
+    wakes: Arc<AtomicU64>,
 }
 
 impl TestApp {
@@ -435,6 +470,7 @@ impl TestApp {
         // goes on.
         ui.contain_layout_feedback();
         let host = host(&ui.runtime);
+        host.window_controls(&ui);
         let error = host.error();
         host.on_issue(move |kind, issue| {
             if kind == zgx::issues::IssueKind::Degraded && issue.contains("did not settle") {
@@ -447,7 +483,12 @@ impl TestApp {
         // A lint finding never lies over what a test clicks.
         host.lint_strip(false);
         host.reload().map_err(|error| error.to_string())?;
-        let executor = Rc::new(RefCell::new(LocalExecutor::new()));
+        // (Counted: what an app at rest asks of its window is nothing.)
+        let wakes = Arc::new(AtomicU64::new(0));
+        let woken = wakes.clone();
+        let executor = Rc::new(RefCell::new(LocalExecutor::with_wake(move || {
+            woken.fetch_add(1, Ordering::Relaxed);
+        })));
         let clock = FrameClock::new();
         let natives = zgx::native_view::NativeViews::new();
         let handle = ui.mount(provide(
@@ -468,6 +509,7 @@ impl TestApp {
             start: Instant::now(),
             natives,
             desktop: None,
+            wakes,
         };
         app.settle();
         // A window lays out before its first frame.
@@ -519,6 +561,7 @@ impl TestApp {
             start: self.start,
             natives,
             desktop: self.desktop.clone(),
+            wakes: self.wakes.clone(),
         };
         app.settle();
         app.lay_out();
@@ -548,6 +591,12 @@ impl TestApp {
         })
     }
 
+    /// How many times its tasks have asked a window's event loop to wake
+    /// so far (a task woken from another thread, a timer due): what an app
+    /// at rest asks is none.
+    pub fn wakes(&self) -> u64 {
+        self.wakes.load(Ordering::Relaxed)
+    }
     /// Run what is ready (handlers' tasks, settled host calls) until
     /// nothing is.
     pub fn settle(&self) {
@@ -613,6 +662,12 @@ impl TestApp {
         let interval = Duration::from_secs_f64(1. / 60.);
         self.frame.set(self.frame.get() + n);
         self.run_timers(self.host.0.timers.test_now() + interval * n as u32);
+    }
+    /// Whether anything waits for the next frame (an animation, a
+    /// `ui.frames` measure): a window at rest asks for none.
+    #[doc(hidden)]
+    pub fn wants_frame(&self) -> bool {
+        self.clock.wants_frame()
     }
     /// `n` frames: an animation's worth.
     pub fn frames(&self, n: usize) {

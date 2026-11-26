@@ -249,6 +249,40 @@ fn the_window_zoom_is_a_state_a_script_reads_and_sets() {
     assert!(!h.ui.zoomable());
 }
 
+/// `ui.window.hold_frames` holds the app's window's frame (the host draws
+/// none) until the script lets it go or the hold runs out; asked again, it
+/// holds again.
+#[test]
+fn the_window_holds_its_frame_as_a_script_asks() {
+    let mut h = Harness::inline(
+        r##"return ui.column {
+            ui.button { id = "hold", on_click = function() ui.window.hold_frames(200) end, "Hold" },
+            ui.button { id = "go", on_click = function() ui.window.release_frames() end, "Go" },
+            ui.button { id = "forever", on_click = function() ui.window.hold_frames(60000) end, "Forever" },
+        }"##,
+    );
+    h.host.window_hold(&h.ui);
+    h.frames(1);
+    let now = std::time::Instant::now;
+    assert_eq!(h.ui.frames_held(now()), None, "nothing held at first");
+    h.click("hold");
+    assert_eq!(h.ui.frames_held(now()), None, "no frame drawn to keep yet");
+    h.ui.held_frame_drawn();
+    h.click("hold");
+    assert!(h.ui.frames_held(now()).is_some(), "held");
+    h.click("go");
+    assert_eq!(h.ui.frames_held(now()), None, "let go");
+    h.click("hold");
+    assert!(h.ui.frames_held(now()).is_some(), "held again");
+    h.click("go");
+    // However long it asks, the window shows again within the most.
+    h.ui.held_frame_drawn();
+    h.click("forever");
+    let until = h.ui.frames_held(now()).expect("held");
+    assert!(until <= now() + zgx::frame_hold::FRAME_HOLD_MOST);
+    assert_eq!(h.ui.frames_held(until), None, "ran out");
+}
+
 /// A script that never reads `ui.window.zoom` makes no state for it.
 #[test]
 fn the_window_zoom_is_made_on_first_read() {
@@ -370,6 +404,93 @@ fn a_window_says_its_smallest_and_largest_size() {
     .err()
     .expect("it doesn't load");
     assert!(error.contains("`max_height` go together"), "{error}");
+}
+
+/// A declared window's glass, frame and level reach its host, this
+/// platform's block replacing its own keys per key (`glass` whole); what a
+/// block may not hold, or says wrong, is an error on every platform.
+#[test]
+fn a_window_says_how_it_looks_by_platform() {
+    use zgx_script::window_look::{Glass, Level, Material, this_platform};
+    let here = this_platform();
+    let other = if here == "linux" { "macos" } else { "linux" };
+    let h = Harness::inline(&format!(
+        r##"ui.window {{ id = "intro", open = ui.state("intro", true), transparent = true, decorations = false,
+            level = "always_on_top", glass = {{ material = "sidebar", plain = true }},
+            {here} = {{ decorations = true, glass = {{ material = "hud" }}, title = "Here" }},
+            {other} = {{ shadow = false }}, ui.text("Intro") }}
+        ui.window {{ id = "plain", open = ui.state("plain", true), ui.text("Plain") }}
+        return ui.text("main")"##
+    ));
+    let look = |id: &str| h.host.window_extras(id).look;
+    let intro = look("intro");
+    assert_eq!(intro.decorations, Some(true), "this platform's");
+    assert_eq!(
+        intro.glass,
+        Some(Glass {
+            material: Material::Hud,
+            plain: false
+        }),
+        "the block's glass whole"
+    );
+    assert_eq!(
+        (intro.transparent, intro.level, intro.shadow),
+        (Some(true), Some(Level::AlwaysOnTop), None)
+    );
+    let title = h
+        .host
+        .windows()
+        .get()
+        .iter()
+        .find(|w| w.id == "intro")
+        .unwrap()
+        .title
+        .clone();
+    assert_eq!(title, "Here");
+    assert_eq!(look("plain"), Default::default());
+    let refused = |options: &str| {
+        zgx_script::testing::TestApp::try_new(|runtime| {
+            zgx_script::ScriptHost::inline(
+                runtime,
+                "app",
+                format!(
+                    r##"ui.window {{ id = "w", open = ui.state("w", true), {options}, ui.text("w") }}
+                    return ui.text("main")"##
+                ),
+            )
+        })
+        .err()
+        .expect("it doesn't load")
+    };
+    for (options, said) in [
+        (
+            format!("{other} = {{ open = true }}"),
+            format!("`{other}` has `open`, which isn't a window key"),
+        ),
+        (
+            format!("{other} = {{ {here} = {{}} }}"),
+            format!("`{other}` holds `{here}`"),
+        ),
+        (
+            format!("{other} = {{ level = \"top\" }}"),
+            "`level` is `top`: one of normal, always_on_top".into(),
+        ),
+        (
+            format!("{other} = 3"),
+            format!("`{other}` is not a table of window keys"),
+        ),
+        (
+            "ios = { shadow = false }".into(),
+            "unknown option `ios`".into(),
+        ),
+        (
+            "glass = { material = \"frost\" }".into(),
+            "`glass.material` is `frost`".into(),
+        ),
+    ] {
+        let error = refused(&options);
+        assert!(error.contains(&said), "{options}: {error}");
+    }
 }
 
 /// `ui.window.size`: the window's size in points, followed, for decisions

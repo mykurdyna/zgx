@@ -107,6 +107,10 @@ pub trait Hooks {
         let _ = (node, tag, selection);
         false
     }
+    /// `NodeHandle::text_edits`: a text area with atoms over its own model.
+    fn editor(&self) -> Option<Rc<dyn crate::widgets::TextEdits>> {
+        None
+    }
 }
 
 /// A handle to a DOM node, for `on_mount`: its measurements from `hooks`,
@@ -615,6 +619,8 @@ pub struct DomAtoms {
     pub wash: Option<crate::scene::Color>,
     /// How its atoms show beyond a wash (`View::atom_style`).
     pub style: Option<crate::editor_atom_style::AtomStyle>,
+    /// How its atoms go on the clipboard beyond the page (`View::atom_codec`).
+    pub codec: Option<crate::widgets::AtomCodec>,
 }
 pub enum ElementKind {
     Box(Layout),
@@ -2764,6 +2770,14 @@ pub fn drawing_with<R>(
     let drawn = draw();
     crate::canvas::DOM_MEASURE.with(|slot| *slot.borrow_mut() = previous);
     drawn
+}
+
+/// Make `measure` what `canvas::measure_text_outside` measures with: text
+/// at a size in a font, wrapped at a width or not, as the page lays it out.
+pub fn set_text_measure(
+    measure: impl Fn(&str, f32, Option<f32>, &crate::text_layout::FontStyle) -> (f32, f32) + 'static,
+) {
+    crate::canvas::DOM_TEXT_MEASURE.with(|slot| *slot.borrow_mut() = Some(Box::new(measure)));
 }
 
 /// A canvas text's font, as the CSS `font` shorthand Canvas 2D takes.

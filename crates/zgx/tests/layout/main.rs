@@ -52,6 +52,8 @@ mod panel_layout;
 mod percent_fields;
 #[path = "../percent_through_regions.rs"]
 mod percent_through_regions;
+#[path = "../recycled_placements.rs"]
+mod recycled_placements;
 #[path = "../resize_regions.rs"]
 mod resize_regions;
 #[path = "../rtl_layout.rs"]
@@ -60,6 +62,8 @@ mod rtl_layout;
 mod rtl_scroll;
 #[path = "../size_calc.rs"]
 mod size_calc;
+#[path = "../snap_held_width.rs"]
+mod snap_held_width;
 #[path = "../sticky.rs"]
 mod sticky;
 #[path = "../text_reach.rs"]

@@ -170,6 +170,8 @@ jobs:
       # A fork changed without a version fails here, on its own pull request,
       # not at the release. A second or two: no build.
       - run: python3 scripts/check_forks.py --offline-ok
+      # The release check's hand-written lists (forks, packages) are the tree's.
+      - run: python3 scripts/check_release_lists.py
       # Ubuntu mirrors are sometimes very slow; reuse last month's .debs.
       - id: apt-key
         run: echo "month=$(date +%Y-%m)" >> "$GITHUB_OUTPUT"
@@ -287,6 +289,9 @@ jobs:
       - name: Use the private Vulkan loader
         if: ${{ !cancelled() && steps.linux-packages.outcome == 'success' }}
         run: printf 'LD_LIBRARY_PATH=%s/zgx-vulkan-loader/build/loader\n' "$HOME" >> "$GITHUB_ENV"
+      # As an app from crates.io builds them: without the workspace's patched
+      # winit, wgpu-hal and AccessKit (docs/releasing.md).
+      - run: scripts/unpatched_check.sh
       # With 3D scenes (zgx-script's `scene3d`, off by default; the Windows
       # and macOS jobs test without it).
       - run: cargo test -p zgx -p zgx-components -p zgx-desktop -p zgx-workload -p zgx-script --all-targets --features zgx-script/scene3d --locked
@@ -755,10 +760,15 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Also here: a change to macOS-only code runs this job without the Linux one.
       - run: cargo fmt --all -- --check
+      # As an app from crates.io builds them: without the workspace's patched
+      # winit, wgpu-hal and AccessKit (docs/releasing.md).
+      - run: scripts/unpatched_check.sh
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test -p zgx -p zgx-components -p zgx-desktop -p zgx-workload --all-targets --locked
       # Text in every script, shaped in the system's own fonts.
-      - run: cargo test -p zgx-gpu --test text_scripts --test editor_selection --locked
+      - run: cargo test -p zgx-gpu --test text_scripts --test editor_selection --test patched_wgpu_hal --locked
+      # Metal's queue really goes at rest (zgx's wgpu-hal patch).
+      - run: cargo test -p zgx-gpu --lib --locked -- queue_rest_tests
       - run: cargo test -p zgx-fx --locked
       # The mixer offline; its decoders (AAC through AudioToolbox) and the
       # device host, which builds CoreAudio's but opens no output.
@@ -777,6 +787,8 @@ jobs:
       - run: cargo test -p zgx-desktop --lib --locked clipboard::tests::html_and_its_text_round_trip_through_the_system_clipboard -- --ignored --exact
       # Types of an app's own, as Chromium's web custom data, the same way.
       - run: cargo test -p zgx-desktop --lib --locked clipboard::tests::types_round_trip_through_the_system_clipboard -- --ignored --exact
+      # An image with its text, HTML and types in one change, the same way.
+      - run: cargo test -p zgx-desktop --lib --locked clipboard::tests::an_image_with_its_text_and_types_round_trips_through_the_system_clipboard -- --ignored --exact
       # The soak (an app used for a while holds what it did), on Metal.
       - run: cargo test -p zgx-script --test soak --locked
       - run: cargo test -p zgx-run --test audit --locked
@@ -848,6 +860,10 @@ jobs:
     if: fromJSON(needs.plan.outputs.jobs).windows
     runs-on: windows-latest
     timeout-minutes: 60
+    env:
+      # The ffmpeg the Video step installs, and its cache's key: a new one is
+      # a new download (choco's community feed, which goes down: #2513).
+      FFMPEG_VERSION: "9.1.0"
     steps:
       - uses: actions/checkout@v4
         # The merge's base too, for the Video step to see what changed.
@@ -870,7 +886,7 @@ jobs:
       # separator bug), in one run.
       - run: cargo test -p zgx -p zgx-components -p zgx-desktop -p zgx-script --lib --test components --test bundle --locked
       # Text in every script, shaped in the system's own fonts.
-      - run: cargo test -p zgx-gpu --test text_scripts --test editor_selection --locked
+      - run: cargo test -p zgx-gpu --test text_scripts --test editor_selection --test patched_wgpu_hal --locked
       - run: cargo test -p zgx-fx --locked
       - run: cargo test -p zgx-audio --locked
       - run: cargo test -p zgx-audio --features device,vorbis,mp3,opus,aac,hrtf --locked
@@ -901,6 +917,8 @@ jobs:
       - run: cargo test -p zgx-desktop --lib --locked clipboard::tests::html_and_its_text_round_trip_through_the_system_clipboard -- --ignored --exact
       # Types of an app's own, as Chromium's web custom data, the same way.
       - run: cargo test -p zgx-desktop --lib --locked clipboard::tests::types_round_trip_through_the_system_clipboard -- --ignored --exact
+      # An image with its text, HTML and types in one change, the same way.
+      - run: cargo test -p zgx-desktop --lib --locked clipboard::tests::an_image_with_its_text_and_types_round_trips_through_the_system_clipboard -- --ignored --exact
       # Terminal sessions on real ptys (openpty, ConPTY): exact cells, input, exits.
       - run: cargo test -p zgx-terminal --locked
       # Real programs through ConPTY, from the image (zgx-terminal's ignored
@@ -930,6 +948,9 @@ jobs:
       # `zgx test` leaves nothing in the temp directory, and Ctrl-Break (a
       # console interrupt) mid-run removes what it made first.
       - run: cargo test -p zgx-script --test test_runner_temp --locked
+      # Native modules, loaded as Windows libraries: source bundles, module
+      # checks, manifests refused. The Linux job runs them with all features.
+      - run: cargo test -p zgx-script --features modules --test native_modules --locked
       - run: cargo test -p zgx-script --test state --locked -- --test-threads=1 script::runaway script::a_script_short_of_its_budget script::garbage_from_builtins script::copies_of_state script::a_script_keeping_nodes
       # The vendored accesskit_windows' tests of zgx's patches (UIA's
       # HeadingLevel, and a grid cell named by its text for Narrator;
@@ -1033,30 +1054,80 @@ jobs:
       # its sources and the workspace crates it builds on (`cargo metadata`
       # says which), vendor/, the lockfile and this workflow; always on
       # main. Runner time is shared.
-      - name: Video
+      - name: Video plan
+        id: video
         if: ${{ !cancelled() }}
         shell: bash
         run: |
           sources='^crates/zgx(-video|-gpu|-script|-3d|-run|-desktop|-components|-fx|-terminal)?/|^comparisons/workload/|^vendor/|^Cargo\.(lock|toml)$|^\.github/workflows/ci\.yml$'
           if [ "${{ github.event_name }}" = pull_request ] && ! git diff --name-only HEAD^1 HEAD | grep -qE "$sources"; then
             echo "### Video: skipped, no change to what zgx-video compiles" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
           fi
+      # The ffmpeg choco unpacked, kept by its version: a run that finds it
+      # here installs nothing. Saved by the first run that installs it
+      # (main's are every pull request's).
+      - name: ffmpeg from the cache
+        id: ffmpeg-cache
+        if: ${{ !cancelled() && steps.video.outputs.run == 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: C:\ProgramData\chocolatey\lib\ffmpeg
+          key: ffmpeg-choco-${{ env.FFMPEG_VERSION }}-${{ runner.os }}
+      - name: Video
+        if: ${{ !cancelled() && steps.video.outputs.run == 'true' }}
+        shell: bash
+        run: |
           start=$SECONDS
-          choco install ffmpeg -y --no-progress > "$RUNNER_TEMP/ffmpeg-install.log" || { cat "$RUNNER_TEMP/ffmpeg-install.log"; exit 1; }
-          echo "### Video: ffmpeg installed in $(( SECONDS - start )) s" >> "$GITHUB_STEP_SUMMARY"
           # choco's shims aren't always on this step's PATH once it's done
           # (ffmpeg not found, exit 127, on some runs): the folder of the
           # binaries it unpacked goes first, so the tests find ffmpeg.exe
           # and the ffprobe.exe beside it. None found fails the step: the
           # tests of what ffmpeg encodes would pass by skipping.
+          # choco unpacks it under lib/ffmpeg* (at any depth: tools/, bin/),
+          # or leaves only its shims in bin/. A folder that isn't there is no
+          # error: `find` exits 1 on one, and under `-e -o pipefail` a
+          # substitution of it ended the step with no output (#2352, #2416,
+          # #2435), before the fallback and the messages below could run.
           choco_root=$(cygpath -u "${ChocolateyInstall:-C:\ProgramData\chocolatey}")
-          found=$(find "$choco_root/lib/ffmpeg" -name ffmpeg.exe 2>/dev/null | head -n 1)
-          dir=${found:+$(dirname "$found")}
-          if [ -z "$dir" ] && [ -f "$choco_root/bin/ffmpeg.exe" ]; then dir="$choco_root/bin"; fi
-          if [ -z "$dir" ] || [ ! -f "$dir/ffprobe.exe" ]; then
-            echo "::error::choco installed ffmpeg, but no ffmpeg.exe with ffprobe.exe beside it is under $choco_root/lib/ffmpeg or $choco_root/bin: the video tests would skip what ffmpeg encodes"
-            find "$choco_root/lib/ffmpeg" -maxdepth 4 2>/dev/null | head -n 40
+          find_ffmpeg() {
+            roots=("$choco_root"/lib/ffmpeg*)
+            dir=
+            while IFS= read -r exe; do
+              if [ -f "$(dirname "$exe")/ffprobe.exe" ]; then dir=$(dirname "$exe"); break; fi
+            done < <(find "${roots[@]}" -iname ffmpeg.exe 2>/dev/null || true)
+            if [ -z "$dir" ] && [ -f "$choco_root/bin/ffmpeg.exe" ] && [ -f "$choco_root/bin/ffprobe.exe" ]; then dir="$choco_root/bin"; fi
+          }
+          # From the cache, if it held this version; otherwise choco installs it.
+          # choco exits 0 having installed nothing when its feed fails (a 504
+          # from community.chocolatey.org: "Chocolatey installed 0/0
+          # packages"), so what it unpacked is what says it worked. Tried
+          # again after a pause, each attempt's log kept.
+          find_ffmpeg
+          attempt=0
+          [ -n "$dir" ] && echo "### Video: ffmpeg $FFMPEG_VERSION from the cache" >> "$GITHUB_STEP_SUMMARY"
+          for attempt in $([ -n "$dir" ] || echo 1 2 3 4); do
+            # (Again with --force: a first attempt cut off halfway is
+            # "already installed" to a plain one.)
+            force=; [ "$attempt" = 1 ] || force=--force
+            choco install ffmpeg --version "$FFMPEG_VERSION" -y --no-progress $force > "$RUNNER_TEMP/ffmpeg-install.log" 2>&1 || true
+            find_ffmpeg
+            [ -n "$dir" ] && break
+            echo "::warning::choco install ffmpeg, attempt $attempt, left no ffmpeg.exe with ffprobe.exe: $(grep -m1 -iE 'failed|unable|error' "$RUNNER_TEMP/ffmpeg-install.log" || tail -n 1 "$RUNNER_TEMP/ffmpeg-install.log")"
+            cat "$RUNNER_TEMP/ffmpeg-install.log" >> "$RUNNER_TEMP/ffmpeg-install-all.log"
+            [ "$attempt" = 4 ] || sleep $(( attempt * 30 ))
+          done
+          [ "$attempt" = 0 ] || echo "### Video: choco install ffmpeg $FFMPEG_VERSION, $(( SECONDS - start )) s over $attempt attempt(s)" >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "$dir" ]; then
+            echo "::error::choco installed ffmpeg, but no ffmpeg.exe with ffprobe.exe beside it is under ${roots[*]} or $choco_root/bin: the video tests would skip what ffmpeg encodes"
+            echo "--- under ${roots[*]}:"
+            find "${roots[@]}" -maxdepth 5 2>&1 | head -n 60 || true
+            echo "--- ffmpeg and ffprobe in $choco_root/bin:"
+            ls -la "$choco_root"/bin/ff*.exe 2>&1 || true
+            echo "--- choco install's logs, every attempt:"
+            cat "$RUNNER_TEMP/ffmpeg-install-all.log" || true
             exit 1
           fi
           export PATH="$dir:$PATH"
