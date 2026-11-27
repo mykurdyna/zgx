@@ -15,12 +15,12 @@ mod converted_at_idle;
 mod converted_with_collection;
 #[path = "../form_values.rs"]
 mod form_values;
-#[path = "../guard_doors.rs"]
-mod guard_doors;
 #[path = "../host_registration.rs"]
 mod host_registration;
 #[path = "../io.rs"]
 mod io;
+#[path = "../json_data.rs"]
+mod json_data;
 #[path = "../large_data.rs"]
 mod large_data;
 #[path = "../load_font.rs"]
@@ -55,8 +55,6 @@ mod plugin_packages;
 mod plugin_report;
 #[path = "../plugin_rows.rs"]
 mod plugin_rows;
-#[path = "../plugin_rules.rs"]
-mod plugin_rules;
 #[path = "../plugin_shared.rs"]
 mod plugin_shared;
 #[path = "../plugin_targets.rs"]
@@ -73,6 +71,8 @@ mod retarget;
 mod router;
 #[path = "../script.rs"]
 mod script;
+#[path = "../scripts_equal.rs"]
+mod scripts_equal;
 #[path = "../shared_upsert.rs"]
 mod shared_upsert;
 #[path = "../socket.rs"]

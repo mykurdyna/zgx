@@ -16,7 +16,7 @@ The Mac validation bundle runs the complete GPU rendering suite, including nativ
 
 # Web views by platform
 
-A web view (`zgx::web_view`, `ui.webview`) is the platform's own page, laid out as a node. How each platform shows it, and what that leaves out:
+A web view (`zgx::web_view`, `ui.webview`) is the platform's own page, laid out as a node. How each platform shows it, and what that leaves out (a page can run in Ladybird instead, the same on every platform: see [Ladybird pages](ladybird.md)):
 
 | | macOS | Windows | Linux |
 | --- | --- | --- | --- |
@@ -42,6 +42,15 @@ A web view (`zgx::web_view`, `ui.webview`) is the platform's own page, laid out 
 | File inputs (`<input type=file>`) | the window's file dialog, a sheet | WebView2's picker | the window's file dialog (the desktop portal's, or zenity's) |
 | Printing (`WebView::print`, the page's `window.print()`) | the print panel, a sheet on the window | WebView2's print preview | GTK's print dialog, transient for the window on X11 |
 | Find in page (`WebView::find`) | WebKit's, without a count of matches | WebView2's, counting matches; its own find bar and browser keys off | WebKit's, counting matches (up to 1,000) |
+| Hovered link (`WebViewState::hovered_link`, Luau `web.hovered_link`) | none: WKWebView doesn't say | the status bar's text (its bar hidden) | the link under the pointer (`mouse-target-changed`) |
+| Theme colour (`WebViewState::theme_color`, Luau `web.theme_color`) | WebKit's `themeColor` (macOS 12) | none: WebView2 doesn't say | WebKit's `theme-color` (WebKitGTK 2.38); none for a page painted on the CPU (`accelerated: false`) |
+| The page's icon (`WebViewOptions::favicons`, `WebViewState::favicon`, Luau `favicons`, `web.favicon`) | none: WKWebView doesn't give it | `FaviconChanged`, then `GetFavicon` as PNG | WebKit's favicon database, turned on for views that ask (`notify::favicon`); icons over http(s) only, not `data:` or an app scheme's |
+| Snapshots (`WebView::snapshot`, Luau `web:snapshot`) | what shows (`takeSnapshot`); the whole page not | what shows and the whole page (DevTools' `Page.captureScreenshot`) | what shows and the whole page (`webkit_web_view_get_snapshot`) |
+| Editing commands (`WebView::edit`, Luau `web:edit`) | AppKit's `copy:`, `cut:`, `paste:`, `selectAll:` and the undo manager's | Chromium's editing commands, through DevTools | WebKit's (`webkit_web_view_execute_editing_command`), the clipboard bridged on Wayland |
+| Reload ignoring the cache (`WebView::reload_ignoring_cache`) | `reloadFromOrigin` | DevTools' `Page.reload` with `ignoreCache` | `webkit_web_view_reload_bypass_cache` |
+| A page that stops answering (`WebViewEvent::Unresponsive`, `WebViewState::unresponsive`) | not said | `Unresponsive` (no `Responsive` follows: WebView2 doesn't say) | both (`is-web-process-responsive`) |
+| Why a page's process ended (`WebViewState::termination`) | unknown: WebKit doesn't say | crashed, out of memory, killed | crashed, out of memory, killed |
+| Visits (`WebViewEvent::Visited`, Luau `on_visit`) | each finished navigation, with its title then | the same | the same |
 | Missing engine | — | placeholder | placeholder (the library is opened as the first page shows) |
 
 A page never saves a file into the person's folders unless the app decides it. Each download it starts (a `download` link, an attachment, a response the page can't show) goes to the app's handler with its URL, suggested name and type; the app saves it at a file the person chose (its save dialog: Luau's `d:ask()`, through the window's file dialogs, so a sandboxed macOS app saves where the person picked) or not. With no handler, or a responder dropped unanswered, it's cancelled. How a saved one goes (bytes received, the end, a failure) reaches the handler's status callback on every platform. A host can also name a folder of its own for them (`ScriptHost::download_dir`, internal for now): Luau's `d:save_temp()` saves there with no dialog, under the suggested name made unique, through the same responder (`save_to`), so the page's session and cookies fetch it on all three desktop backends; zgx-dom shows no web view, so it has no such path.

@@ -1,5 +1,5 @@
 -- zgx's definitions with this app's own theme tokens (`ui.theme.tokens`)
--- and the ids and hooks its plugins may target, its message keys and routes.
+-- and the ids and hooks scripts may target, its message keys and routes.
 -- Written by `zgx types` (and `zgx check`, and the debug host after a
 -- reload that changes the names): don't edit it, and leave it out of
 -- version control. Editors list it in place of zgx.d.luau.
@@ -903,6 +903,17 @@ declare extern type Bitmap with
 	w: number
 	h: number
 end
+-- `ui.json.data`'s (and `load`'s) list or object, read-only, its parts made
+-- as they are read (one of up to 512 values, or of plain values alone, a
+-- read-only table): index it, take `#`, and loop `for k, v in data do`. Not
+-- a table, it fails `pairs`, `ipairs`, `next` and the `table` library
+-- (`ui.json.decode` gives tables). Handed to state or a list, it's never
+-- made into tables.
+declare extern type JsonData with
+	[string | number]: any
+	function __iter(self): ((JsonData, any) -> (any, any), JsonData)
+	function __len(self): number
+end
 declare extern type Shader with
 end
 export type ShaderPass = {
@@ -1676,6 +1687,18 @@ declare extern type Web with
 	-- The pointer over the page, in points from its top left; nil outside.
 	-- (Over a page zgx hears no pointer moves: its nodes had their leave.)
 	pointer: { x: number, y: number }?
+	-- The link under the pointer, as a status bar shows it; nil off links,
+	-- and on macOS (WKWebView doesn't say).
+	hovered_link: string?
+	-- The page's theme colour (`<meta name="theme-color">`) as "#rrggbbaa";
+	-- nil without one, and on Windows (WebView2 doesn't say).
+	theme_color: string?
+	-- The page's icon, with `favicons = true`; nil without one, and on macOS.
+	favicon: Bitmap?
+	-- The page's process stopped answering (not on macOS or with Ladybird).
+	unresponsive: boolean
+	-- Why the page's process last ended; nil while it hasn't.
+	termination: ("crashed" | "out_of_memory" | "killed" | "unknown")?
 	function load(self, url: string): ()
 	function html(self, html: string, base_url: string?): ()
 	function back(self): ()
@@ -1699,6 +1722,16 @@ declare extern type Web with
 	-- hold until they reload. On Windows, storage of the site's other
 	-- subdomains stays.
 	function clear_site_data(self, url: string): Promise<number>
+	-- The page's pixels: what shows ("visible", the default), or the whole
+	-- document ("full_page"; not on macOS, whose WebKit draws only what
+	-- shows). Rejects where the engine can't.
+	-- An editing command, as a browser's Edit menu; raises where the
+	-- engine can't.
+	function edit(self, command: "copy" | "cut" | "paste" | "select_all" | "undo" | "redo"): ()
+	-- Reload, fetching everything again (Shift+reload); raises where the
+	-- engine can't.
+	function reload_ignoring_cache(self): ()
+	function snapshot(self, area: ("visible" | "full_page")?): Promise<Bitmap>
 	-- A page from `ui.web(id, opts)` leaves the host's registry: the next
 	-- `ui.web(id)` makes a new one.
 	function close(self): ()
@@ -1715,6 +1748,11 @@ export type WebOptions = {
 	-- Linux: false paints pages on the CPU, uploading only what changed
 	-- (no backdrop-filter, no 3D perspective). macOS and Windows ignore it.
 	accelerated: boolean?,
+	-- "platform" (the default) or "ladybird" where the host was built with
+	-- it; a page whose engine is missing shows a placeholder.
+	engine: ("platform" | "ladybird")?,
+	-- Keep each page's icon in `web.favicon`, as a browser's tab shows it.
+	favicons: boolean?,
 	[number]: never,
 }
 export type WebEvent = { kind: "started" | "committed" | "finished" | "failed" | "changed", url: string }
@@ -1827,7 +1865,7 @@ export type CommandOptions = {
 	key: (string | State<string> | (() -> string?))?,
 	-- The app's whatever has the keyboard: its key comes to the app before
 	-- a focused web page or terminal, which otherwise get each key first
-	-- (as a browser keeps ⌘T from its pages). Not a plugin's to set.
+	-- (as a browser keeps ⌘T from its pages).
 	reserved: boolean?,
 	run: (() -> ...unknown)?,
 	-- A separator line in `menu` instead of a command.
@@ -2387,6 +2425,7 @@ export type Styles = {
 	-- many points inside its rounded edge instead of being cut: with a large
 	-- `rounded` and an animated clip inset, a soft oval that opens.
 	clip_feather: number?,
+	corner_curve: ("circular" | "continuous")?,
 	layer: boolean?,
 	-- Where an image lies in its box, as fractions of the room to spare:
 	-- { 0.5, 0 } keeps a portrait's top under fit = "cover".
@@ -2590,6 +2629,7 @@ export type StyleProps = {
 	zoom_fixed: Reactive<boolean>?,
 	clip_inset: Reactive<Sides>?,
 	clip_feather: Reactive<number>?,
+	corner_curve: ("circular" | "continuous")?,
 	layer: Reactive<boolean>?,
 	object_position: Reactive<{ number }>?,
 	fit: Reactive<Fit>?,
@@ -2766,11 +2806,9 @@ export type NodeProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: ("target" | "shown")?,
 	window_drag: boolean?,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
-	hook: (string | boolean)?,
-	private: boolean?,
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
+	hook: string?,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -3090,6 +3128,7 @@ export type Props = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -3226,11 +3265,9 @@ export type Props = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -3534,6 +3571,7 @@ export type Props_zoom = Reactive<number>?
 export type Props_zoom_fixed = Reactive<boolean>?
 export type Props_clip_inset = Reactive<Sides>?
 export type Props_clip_feather = Reactive<number>?
+export type Props_corner_curve = ("circular" | "continuous")?
 export type Props_layer = Reactive<boolean>?
 export type Props_object_position = Reactive<{ number }>?
 export type Props_fit = Reactive<Fit>?
@@ -3600,8 +3638,7 @@ export type Props_focus_group = ("vertical" | "horizontal" | "both")?
 export type Props_pointer_events = (PointerEvents | Readable<PointerEvents> | (() -> PointerEvents))?
 export type Props_hit = ("target" | "shown")?
 export type Props_window_drag = boolean?
-export type Props_hook = (string | boolean)?
-export type Props_private = boolean?
+export type Props_hook = string?
 export type Props_selectable = boolean?
 export type Props_selection_color = Reactive<Color>?
 export type Props_selected_text_color = Reactive<Color>?
@@ -3805,6 +3842,7 @@ export type ContainerProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -3941,11 +3979,9 @@ export type ContainerProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -4280,6 +4316,7 @@ export type GlassProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -4415,11 +4452,9 @@ export type GlassProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -4762,6 +4797,7 @@ export type ScrollProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -4898,11 +4934,9 @@ export type ScrollProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -5262,6 +5296,7 @@ export type TextProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -5398,11 +5433,9 @@ export type TextProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -5721,6 +5754,7 @@ export type MarkdownViewProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -5857,11 +5891,9 @@ export type MarkdownViewProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -6282,6 +6314,7 @@ export type RichProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -6418,11 +6451,9 @@ export type RichProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -6735,6 +6766,7 @@ export type ImageProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -6871,11 +6903,9 @@ export type ImageProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -7205,6 +7235,7 @@ export type SvgProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -7341,11 +7372,9 @@ export type SvgProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -7786,6 +7815,7 @@ export type Scene3DProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -7922,11 +7952,9 @@ export type Scene3DProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -8262,6 +8290,7 @@ export type CanvasProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -8398,11 +8427,9 @@ export type CanvasProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -8747,6 +8774,7 @@ export type CheckboxProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -8883,11 +8911,9 @@ export type CheckboxProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -9210,6 +9236,7 @@ export type InputProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -9346,11 +9373,9 @@ export type InputProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -9878,6 +9903,7 @@ export type ProgressProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -10014,11 +10040,9 @@ export type ProgressProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -10332,6 +10356,7 @@ export type SliderProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -10465,11 +10490,9 @@ export type SliderProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -10801,6 +10824,7 @@ export type SegmentedProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -10937,11 +10961,9 @@ export type SegmentedProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -11266,6 +11288,7 @@ export type StepperProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -11402,11 +11425,9 @@ export type StepperProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -11732,6 +11753,7 @@ export type DisclosureProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -11868,11 +11890,9 @@ export type DisclosureProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -12209,6 +12229,7 @@ export type AccordionProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -12345,11 +12366,9 @@ export type AccordionProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -12662,6 +12681,7 @@ export type SectionProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -12796,11 +12816,9 @@ export type SectionProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -13136,6 +13154,7 @@ export type SeparatorProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -13272,11 +13291,9 @@ export type SeparatorProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -13595,6 +13612,7 @@ export type TabsProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -13731,11 +13749,9 @@ export type TabsProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -14076,6 +14092,7 @@ export type TreeProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -14212,11 +14229,9 @@ export type TreeProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -14553,6 +14568,7 @@ export type DataGridProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -14689,11 +14705,9 @@ export type DataGridProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -15026,6 +15040,7 @@ export type CalendarProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -15162,11 +15177,9 @@ export type CalendarProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -15492,6 +15505,7 @@ export type DatePickerProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -15628,11 +15642,9 @@ export type DatePickerProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -15956,6 +15968,7 @@ export type TimeFieldProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -16092,11 +16105,9 @@ export type TimeFieldProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -16419,6 +16430,7 @@ export type ComboboxProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -16555,11 +16567,9 @@ export type ComboboxProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -16890,6 +16900,7 @@ export type CommandPaletteProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -17026,11 +17037,9 @@ export type CommandPaletteProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -17349,6 +17358,7 @@ export type SelectProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -17485,11 +17495,9 @@ export type SelectProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -17815,6 +17823,7 @@ export type SplitProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -17951,11 +17960,9 @@ export type SplitProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -18337,6 +18344,7 @@ export type ListProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -18473,11 +18481,9 @@ export type ListProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -18890,6 +18896,7 @@ export type LayerProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -19026,11 +19033,9 @@ export type LayerProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -19363,6 +19368,7 @@ export type ModalProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -19499,11 +19505,9 @@ export type ModalProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -19854,6 +19858,7 @@ export type PopoverProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -19990,11 +19995,9 @@ export type PopoverProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -20355,6 +20358,7 @@ export type MenuItemProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -20487,11 +20491,9 @@ export type MenuItemProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -20813,6 +20815,7 @@ export type SubmenuProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -20949,11 +20952,9 @@ export type SubmenuProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -21295,6 +21296,7 @@ export type WebViewProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -21431,11 +21433,9 @@ export type WebViewProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -21623,6 +21623,11 @@ export type WebViewProps = {
 	-- Linux: false paints pages on the CPU, uploading only what changed
 	-- (no backdrop-filter, no 3D perspective). macOS and Windows ignore it.
 	accelerated: boolean?,
+	-- "platform" (the default) or "ladybird" where the host was built with
+	-- it; a page whose engine is missing shows a placeholder.
+	engine: ("platform" | "ladybird")?,
+	-- Keep each page's icon in `web.favicon`, as a browser's tab shows it.
+	favicons: boolean?,
 	[number]: never,
 	-- A `ui.web()` controller, so the page outlives the node; the options
 	-- above make one otherwise.
@@ -21640,6 +21645,8 @@ export type WebViewProps = {
 	on_message: ((value: any, origin: string, main_frame: boolean) -> ...unknown)?,
 	on_error: ((url: string, err: string) -> ...unknown)?,
 	on_new_window: ((url: string) -> ...unknown)?,
+	-- A page was visited (a navigation finished), with its title then.
+	on_visit: ((url: string, title: string) -> ...unknown)?,
 	-- A download the page started: save it (`d:save_to`, `d:ask`) or
 	-- not. Without this, none is saved.
 	on_download: ((d: Download) -> ...unknown)?,
@@ -21774,6 +21781,7 @@ export type TerminalProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -21910,11 +21918,9 @@ export type TerminalProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -22228,6 +22234,7 @@ export type HostViewProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -22364,11 +22371,9 @@ export type HostViewProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -22551,7 +22556,7 @@ export type HostViewProps = {
 	[number]: never,
 	name: string,
 }
--- `from`: only what that plugin (by name) contributes.
+-- `from`: only what that script (by name) contributes.
 export type SlotProps = {
 	-- Size and position.
 	w: Props_w,
@@ -22682,6 +22687,7 @@ export type SlotProps = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -22818,11 +22824,9 @@ export type SlotProps = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -23006,7 +23010,7 @@ export type SlotProps = {
 	context: unknown?,
 	from: string?,
 }
--- What a plugin targets: an element by its `id` (`"#save"`), declared hook
+-- What a script targets: an element by its `id` (`"#save"`), declared hook
 -- (`"hook:toolbar.save"`) or class (`".session-row"`). An app's own
 -- definitions (`zgx types`) name every one it declares, for an editor to
 -- offer.
@@ -23021,24 +23025,24 @@ export type HookChain = string
 export type Selector = { __zgx_selector: never }
 -- `ui.override`'s table.
 export type ModuleOverride = {
-	-- The app's module: "@app/components/card".
+	-- The root script's module: "@app/components/card".
 	module: string,
-	-- The plugin's replacement, relative to the plugin: "./card".
+	-- The replacement, relative to the script: "./card".
 	with: string,
 }
--- A plugin's node at an element of the app's, by `target` (`"#save"`,
--- `"hook:toolbar.save"`, `".session-row"`, `"#sidebar >> .session-row"`,
--- `ui.selector('role:button "Save"')`): before it,
--- after it, or in its place (replacing takes `Capability::Override`).
+-- A script's node at an element of the root script's, by `target`
+-- (`"#save"`, `"hook:toolbar.save"`, `".session-row"`,
+-- `"#sidebar >> .session-row"`, `ui.selector('role:button "Save"')`):
+-- before it, after it, or in its place.
 export type HookContribution = {
 	target: HookTarget | HookChain | Selector,
 	before: Node?,
 	after: Node?,
 	replace: Node?,
 }
--- A plugin's functions over an element of the app's, by `target`: each
--- takes the prop's value as it is and returns it changed, run again when
--- what it reads changes (it takes `Capability::Override`). A tooltip's text
+-- A script's functions over an element of the root script's, by `target`:
+-- each takes the prop's value as it is and returns it changed, run again
+-- when what it reads changes. A tooltip's text
 -- passes through as the element is built.
 export type HookFilter = {
 	target: HookTarget | HookChain | Selector,
@@ -23187,6 +23191,7 @@ export type EachOptions = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -23323,11 +23328,9 @@ export type EachOptions = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -23656,6 +23659,7 @@ export type PresenceOptions = {
 	zoom_fixed: Props_zoom_fixed,
 	clip_inset: Props_clip_inset,
 	clip_feather: Props_clip_feather,
+	corner_curve: Props_corner_curve,
 	layer: Props_layer,
 	object_position: Props_object_position,
 	fit: Props_fit,
@@ -23792,11 +23796,9 @@ export type PresenceOptions = {
 	-- show. "shown" (the default) hits where it shows.
 	hit: Props_hit,
 	window_drag: Props_window_drag,
-	-- A hook plugins target (`ui.contribute { target = "hook:name" }`):
-	-- a stable point the app declares. `false` keeps every plugin off the
-	-- element (a password field, a destructive confirm), as `private` does.
+	-- A hook scripts target (`ui.contribute { target = "hook:name" }`):
+	-- a stable point the app declares.
 	hook: Props_hook,
-	private: Props_private,
 	-- The pointer selects the text in it and everything it holds, as on a
 	-- web page (CSS `user-select: text`): drag, double/triple press, Shift,
 	-- ⌘A / Ctrl+A, ⌘C / Ctrl+C. `false` keeps a part out. Off unless set.
@@ -24142,7 +24144,7 @@ declare ui: {
 	-- "Ctrl+Shift+Z" elsewhere (`cmd` is Command on macOS, Control
 	-- elsewhere); a lone modifier ("cmd") as itself, "⌘" or "Ctrl".
 	shortcut_text: (keys: string) -> string,
-	-- The id of the command (the app's or a plugin's) holding a shortcut
+	-- The id of the command (any script's) holding a shortcut
 	-- now, `Shift+Cmd+J` or `cmd+shift+j` alike; nil if none.
 	shortcut_owner: (keys: string) -> string?,
 	window: WindowApi,
@@ -24210,31 +24212,20 @@ declare ui: {
 	-- What `build` makes of the value, entering and exiting as it changes;
 	-- nil shows nothing. The value is `any`, as `each`'s item is.
 	presence: (value: string | Readable<unknown> | (() -> unknown), build: (value: any) -> Node, opts: PresenceOptions?) -> Node,
-	-- Controls no plugin reaches or covers (tool approval, sign-in): drawn and
-	-- hit over all a plugin opens, in the room this holds in flow. The app's
-	-- own script alone makes one.
-	decision: (props: Merge<ContainerProps, { key: string, label: string? }>) -> Node,
-	-- A region no plugin reaches, filters or draws over (a Settings page), but
-	-- for its `plugin_page`s. The app's own script alone makes one.
-	sealed: (props: Merge<ContainerProps, { key: string?, label: string? }>) -> Node,
-	-- In a `sealed` region: that plugin's own page, what it gives
-	-- `ui.contribute("plugin_page", …)`, kept to this box.
-	plugin_page: (props: Merge<Props, { plugin: string }>) -> Node,
-	-- Where plugins' contributions to `name` go.
-	-- A plugin extension point. `context` reaches what is contributed to
+	-- Where scripts' contributions to `name` go: an extension point.
+	-- `context` reaches what is contributed to
 	-- it: a contributed component gets it as `props.slot` (one component,
 	-- an instance per slot: a panel per pane).
 	slot: (name: string, props: SlotProps?) -> Node,
 	contribute: ((name: string, node: Node) -> ()) & ((HookContribution) -> ()),
-	-- A plugin's target by role or name, as written (`'role:button "Save"'`):
+	-- A target by role or name, as written (`'role:button "Save"'`):
 	-- the app's internals, which may change with its next version.
 	selector: (text: string) -> Selector,
-	-- A plugin's filter over an element of the app's (`HookFilter`).
+	-- A script's filter over an element of the root script's (`HookFilter`).
 	filter: (HookFilter) -> (),
-	-- From a plugin: one of the app's `@app/…` modules replaced by the
-	-- plugin's (`with`, one of its own files), which runs as the app's own
-	-- code. Needs `Capability::Override(module)` or `("*")`: a trust grant.
-	-- The replacement reaches the original as `@app-original/…`.
+	-- One of the root script's `@app/…` modules replaced by the script's
+	-- (`with`, one of its own files), which runs in its place. The
+	-- replacement reaches the original as `@app-original/…`.
 	override: (ModuleOverride) -> (),
 	-- The script's (or module's) state for `key`, kept across reloads.
 	state: <T>(key: string, initial: T) -> State<T>,
@@ -24329,9 +24320,7 @@ declare ui: {
 	-- made it goes, and what it raises uncaught is reported once.
 	async: <A...>(f: (A...) -> ()) -> (A...) -> (),
 	-- Actions the app's script defines, called as a Rust host's are
-	-- (`ui.invoke(name, arg)`, `ui.action(name, arg)`), by the app and by
-	-- the plugins it exposes them to (zgx.json's `expose.actions`). A plugin
-	-- defines none.
+	-- (`ui.invoke(name, arg)`, `ui.action(name, arg)`), by every script.
 	actions: (actions: { [string]: (arg: any) -> () }) -> (),
 	-- Where the app is, as React Router keeps it: named routes with
 	-- `:params`, history, the platform's back and forward input, and deep
@@ -24367,8 +24356,7 @@ declare ui: {
 	-- connector, as `useWebSocket`: messages to `on_message`, `send` queued
 	-- while it is not open and sent in order once it is, opened again after
 	-- a growing wait when it ends. `url` may be a function: a state it
-	-- reads changing opens it again. Closed with its owner; a plugin needs
-	-- the host's grant.
+	-- reads changing opens it again. Closed with its owner.
 	socket: (url: string | () -> string, opts: SocketOptions?) -> Socket,
 	-- A promise settled after `ms`, to await in a task (a retry's wait).
 	sleep: (ms: number) -> Promise<nil>,
@@ -24400,7 +24388,7 @@ declare ui: {
 	-- selection, to put back later; nil if nothing has focus.
 	focus_snapshot: () -> FocusSnapshot?,
 	-- An HTTP request through the host's transport (`ScriptHost::fetcher`):
-	-- a promise of a `Response`. A plugin needs the host's grant.
+	-- a promise of a `Response`.
 	fetch: (url: string, opts: FetchOptions?) -> Promise<Response>,
 	-- The clipboard's text (nil if it holds none), and putting text on it;
 	-- its HTML (a browser's or word processor's copy; nil if it holds
@@ -24454,7 +24442,7 @@ declare ui: {
 	-- parts: await each part before the next.
 	write_file: (file: File | string, data: string | { base64: string }, opts: { append: boolean? }?) -> Promise<nil>,
 	-- A TrueType or OpenType font file (a path from the script's directory,
-	-- a plugin's inside it, or a File the user picked), or a font's bytes in
+	-- or a File the user picked), or a font's bytes in
 	-- base64 (`{ base64 = … }`), added to every window's text: a promise of
 	-- the family names it holds, which `font` then names. Text in those
 	-- families lays out and draws again in it.
@@ -24468,7 +24456,6 @@ declare ui: {
 	-- Files and URLs the system asks the app to open (a file opened with it,
 	-- a link to it, a second launch's), the launch's included: the files
 	-- are the user's choice, as a dialog's are (`ui.read_file` takes them).
-	-- The app's only: a plugin's is an error.
 	on_open: (handler: (e: { files: { File }, urls: { string } }) -> ()) -> (),
 	-- `T` comes from the state's `set`, so a literal fits a state of a
 	-- union (`ui.set(density, "compact")` for `"comfortable" | "compact"`)
@@ -24516,13 +24503,11 @@ declare ui: {
 	-- The controls on screen, in document order with popups and modals last
 	-- (a plain group, a text, a scroll view or a table's rows are not
 	-- controls). Nothing is built until you ask. `{}` where the host gave
-	-- no window; an error in a plugin. Under a host's guard, only those the
-	-- script mounted.
+	-- no window.
 	controls: (opts: ControlsOptions?) -> { Control },
 	-- Presses and releases the primary button at the middle of the control
 	-- `handle` names, as `zgx inspect click` does. False, doing nothing,
-	-- for a handle whose control is gone, hidden or covered; an error under
-	-- a host's guard for a control the script didn't mount.
+	-- for a handle whose control is gone, hidden or covered.
 	press: (handle: number) -> boolean,
 	-- The text a control (`ui.controls`' `handle`) shows, a word apart, at most
 	-- `cap` (400) characters; "" once it is gone. A dialog's, for a notice.
@@ -24541,6 +24526,12 @@ declare ui: {
 	json: {
 		encode: (value: any, opts: { pretty: boolean? }?) -> string,
 		decode: (text: string) -> any,
+		-- The JSON `text` read-only (`JsonData`), its parts made as they are
+		-- read: a document handed to `ui.state` or a list whole is never
+		-- made into tables. `load` reads a file, found as `require` finds a
+		-- module ("./feed.json"; `.json` when it has no extension).
+		data: (text: string) -> JsonData,
+		load: (path: string) -> JsonData,
 	},
 	-- `n` formatted, as `Intl.NumberFormat` would: `ui.number(1234.5)` is
 	-- "1,234.50", `{ style = "percent" }` takes a fraction (0.05 is "5%"),
@@ -25451,7 +25442,7 @@ declare audio: {
 	play: (sound: Sound, opts: PlayOptions?) -> Voice,
 	-- For `sound =`: `f` chooses the sound as the control is activated.
 	choose: (f: () -> Sound | SoundWith | false | nil) -> SoundChoice,
-	-- A plugin's `audio.bus()` is its own bus, the only one it reaches.
+	-- A bus by name: "master", "ui", "music", "world" or one added.
 	bus: (name: string?) -> Bus?,
 	-- Under `master` unless `parent` says.
 	add_bus: (name: string, opts: { parent: string? }?) -> Bus,

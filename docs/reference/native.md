@@ -23,7 +23,7 @@ ui.command(opts: CommandOptions) -> ()
 
 ## Web view options
 
-`ui.webview` takes these, `ui.web` the first seven, and any [property](properties.md) and [event](events.md):
+`ui.webview` takes these, `ui.web` the first nine, and any [property](properties.md) and [event](events.md):
 
 | Option | Type | Default | |
 | --- | --- | --- | --- |
@@ -34,6 +34,8 @@ ui.command(opts: CommandOptions) -> ()
 | `messages` | `boolean` | `true` | the page's `window.zgx.postMessage(value)` reaches `on_message` |
 | `new_windows` | `boolean` | `true` | `window.open` and `target=_blank` reach `on_new_window` (and open nothing) |
 | `accelerated` | `boolean` | `true` | Linux only (macOS and Windows ignore it): `false` paints the page on the CPU and uploads only what each frame changed, far cheaper for a page that animates a little, but draws no `backdrop-filter` and flattens 3D transforms ([what it saves](../native-surfaces.md#what-a-linux-page-frame-costs)) |
+| `engine` | `string` | `"platform"` | `"ladybird"`: the page runs in Ladybird where the desktop host has it (zgx-desktop's `ladybird` feature), a placeholder where not ([Ladybird pages](../ladybird.md)) |
+| `favicons` | `boolean` | `false` | keep each page's icon in `web.favicon` (a bitmap), as a browser's tab shows it; none on macOS, whose WebKit doesn't give it |
 | `web` | `Web` | a page for the node | a controller, so the page outlives the node (a tab switched away and back) |
 | `src` | `Reactive<string>` | none | the URL; the page navigates when it changes |
 | `html`, `base_url` | `string`, `string?` | none | a page from markup, loaded once |
@@ -43,9 +45,10 @@ ui.command(opts: CommandOptions) -> ()
 | `on_message` | `(value: any, origin: string, main_frame: boolean) -> ()` | none | what the page posted, as Luau data, and who posted it: the sending frame's origin (`https://example.com`) and whether it is the top frame. Any page the view shows, and any iframe in it, can post: check `origin` before acting on a message |
 | `on_error` | `(url: string, err: string) -> ()` | none | a navigation failed, or the page's process ended (`url` empty) |
 | `on_new_window` | `(url: string) -> ()` | none | |
+| `on_visit` | `(url: string, title: string) -> ()` | none | a page was visited: each finished navigation, with the title it had then, on every engine (what a history records; later titles come to `on_title`) |
 | `on_download` | `(d: Download) -> ()` | none | a download the page started (a `download` link, an attachment): `d.url`, `d.name` (as the page or its server suggests it) and `d.mime`; save it with `d:save_to(file, opts?)` (a file the user picked, from `ui.save_file`) or `d:ask(opts?)` (the save dialog suggesting `d.name`: a promise of the file saved to, or nil), or `d:cancel()`. Internal, subject to change: `d:save_temp(opts?)` saves it with no dialog in the folder the host names for downloads (`ScriptHost::download_dir`; it raises until one is named), under `d.name` made unique, and gives a promise of the file once it is whole, readable like a picked one, or nil if it stopped; the browser's own request and cookies fetch it, on macOS, Windows and Linux alike (zgx-dom has no web view, so no such path). `opts` takes `on_progress(received, total)` and `on_finish(ok, err)`. All three need the Files grant. Without `on_download`, and for a `d` never answered, nothing is saved: a page never starts a download into the user's folders without the app deciding |
 
-A `Web` controller's `url`, `title`, `loading`, `progress`, `can_go_back`, `can_go_forward`, `focused`, `error`, `full_screen` (an element of the page is full screen: on macOS in WebKit's window over the screen, on Windows and Linux filling the node, which an app grows to show it so) and `pointer` (`{ x, y }` in points while the pointer is over the page, else nil) are tracked like state: a text or computed reading them follows the page. Its methods: `load(url)`, `html(html, base_url?)`, `back()`, `forward()`, `reload()`, `stop()`, `focus()`, `blur()`, `devtools()`, `exit_full_screen()`, `zoom(z)`, `run(js)`, `eval(js, function(value, err) … end)` (the script's value as Luau data, or nil and the error), `clear_site_data(url)` (a promise of how many records went: everything the page's profile keeps for the url's site, its domain and those under it, for every web on the profile; open pages keep what they hold until they reload; on Windows, storage of the site's other subdomains stays), and `close()`.
+A `Web` controller's `url`, `title`, `loading`, `progress`, `can_go_back`, `can_go_forward`, `focused`, `error`, `full_screen` (an element of the page is full screen: on macOS in WebKit's window over the screen, on Windows and Linux filling the node, which an app grows to show it so), `pointer` (`{ x, y }` in points while the pointer is over the page, else nil), `favicon` (the page's icon as a bitmap, with `favicons = true`), `unresponsive` (its process stopped answering; not said on macOS or by Ladybird) and `termination` (why its process last ended: `"crashed"`, `"out_of_memory"`, `"killed"` or `"unknown"`) are tracked like state: a text or computed reading them follows the page. Its methods: `load(url)`, `html(html, base_url?)`, `back()`, `forward()`, `reload()`, `stop()`, `focus()`, `blur()`, `devtools()`, `exit_full_screen()`, `zoom(z)`, `run(js)`, `eval(js, function(value, err) … end)` (the script's value as Luau data, or nil and the error), `clear_site_data(url)` (a promise of how many records went: everything the page's profile keeps for the url's site, its domain and those under it, for every web on the profile; open pages keep what they hold until they reload; on Windows, storage of the site's other subdomains stays), `edit(command)` (`"copy"`, `"cut"`, `"paste"`, `"select_all"`, `"undo"`, `"redo"`: a browser's Edit menu, through the system's clipboard; raises where the engine can't), `reload_ignoring_cache()` (Shift+reload), `snapshot(area?)` (a promise of the page's pixels as a bitmap, straight from its engine: `"visible"`, the default, what the page shows; `"full_page"` the whole document, which macOS's WebKit can't, rejecting), and `close()`.
 
 ## Terminal options
 
@@ -314,8 +317,6 @@ Each platform shows them its own way, and needs the app to say who it is:
 | Windows | A toast, for the app's AppUserModelID: its `application_id` (`Application::application_id`, `zgx.json`'s `application_id`). Without one, `"unsupported"`. The first notification sets it as the process's AppUserModelID and registers it for the user, as an unpackaged app's toasts need: the key `HKEY_CURRENT_USER\Software\Classes\AppUserModelId\<application_id>` with a `DisplayName` value, the executable's name, which the toast shows as its sender. Nothing else is written, and nothing needs administrator rights. | An overlay on the taskbar button (`ITaskbarList3::SetOverlayIcon`): a red disc with the count (`9+` past 99), a plain disc for text, described to screen readers as "3 unread" (or the text). |
 | Linux | The desktop's notification server (`org.freedesktop.Notifications` on the session bus); none running gets `"unsupported"`. | The count docks read from a launcher entry (Dash to Dock, KDE's task manager, Plank), matched to the app's desktop file (`Application::desktop_id`, else `application_id`). |
 
-A plugin can do neither: they are the app's.
-
 ```lua
 local unread = ui.state("unread", 0)
 local function arrived(from: string, text: string)
@@ -356,9 +357,7 @@ ui.text_of(handle: number, cap: number?) -> string
 
 `ui.text_of(handle, cap)` is the text the control shows, its texts a word apart, at most `cap` characters (400 if not given), leaving out what is hidden from assistive technology or does not show: a dialog's, say, to send as a notice. `""` once the control is gone.
 
-A Rust host gives the window with `ScriptHost::window_controls(&ui)` (`zgx-run` does); without one they do nothing (`{}`, false and `""`). They are the app's own: a plugin that calls one gets an error.
-
-Under a host's guard (`ScriptHost::guard`: a template previewed), a script's reach is its own view: `ui.controls` lists only what it mounted, its popups, menus and dialogs with it, not a control the host draws beside it or a `ui.host_view`'s. `ui.press` and `ui.text_of` of any other control are errors that say so, `ui.text_of` leaves out a host view inside what it reads, and a press whose middle lies over a host view does nothing. The guard is not asked: a host that wrote one before needs no new answer. With no view mounted in the window, nothing is listed.
+A Rust host gives the window with `ScriptHost::window_controls(&ui)` (`zgx-run` does); without one they do nothing (`{}`, false and `""`).
 
 ## Example
 

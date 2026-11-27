@@ -553,7 +553,7 @@ pub(crate) struct CodeOptions {
     /// `line_insets`: each line's room (`EditorHandle::set_line_insets`).
     line_insets: Option<crate::widgets::LineInsets>,
     /// `line_marks`: each line's marks (`EditorHandle::set_line_marks`).
-    line_marks: Option<crate::widgets::LineMarks>,
+    line_marks: Option<crate::editor_lines::MarksGiver>,
     decorations: Option<Box<dyn FnMut() -> Decorations>>,
     underlines: Option<Box<dyn FnMut() -> Underlines>>,
     current_line: Option<Box<dyn FnMut() -> Option<crate::scene::Color>>>,
@@ -2075,7 +2075,19 @@ impl View {
         mut self,
         marks: impl Fn(usize, &str, u32) -> Vec<crate::widgets::LineMark> + 'static,
     ) -> Self {
-        self.code_mut().line_marks = Some(std::rc::Rc::new(marks));
+        let marks = crate::editor_lines::MarksGiver::Each(std::rc::Rc::new(marks));
+        self.code_mut().line_marks = Some(marks);
+        self
+    }
+    /// `line_marks`, by an app that keeps its answers: shared with it, a
+    /// draw copies no mark.
+    #[doc(hidden)]
+    pub fn kept_line_marks(
+        mut self,
+        marks: impl Fn(usize, &str, u32) -> std::rc::Rc<[crate::widgets::LineMark]> + 'static,
+    ) -> Self {
+        let marks = crate::editor_lines::MarksGiver::Kept(std::rc::Rc::new(marks));
+        self.code_mut().line_marks = Some(marks);
         self
     }
     /// A text area's scroll groups (`LineInset::scroll_group`, a code
@@ -3589,30 +3601,6 @@ pub fn hoist(
 /// they are cut to it too, instead of reaching over the window.
 pub fn confined(child: View) -> View {
     View::new(Kind::Confined(Box::new(child)))
-}
-/// Whether popups opened in a subtree stay in the window for now, under its
-/// top layer, rather than in windows of their own (`Ui::set_popup_screens`),
-/// which nothing in the window can be above. A service: `provide` it around
-/// what may not cover the window's top layer.
-pub struct PopupsInWindow(pub Signal<bool>);
-/// The screens popups opened under `held` may reach: none while it holds.
-#[cold]
-#[inline(never)]
-fn held_screens(
-    ui: &mut Ui,
-    owner: NodeId,
-    held: Rc<PopupsInWindow>,
-) -> Signal<Vec<crate::scene::Rect>> {
-    let all = ui.popup_screens();
-    let screens = ui.signal(Vec::new());
-    let out = screens.clone();
-    ui.bind(owner, move || {
-        out.set(match held.0.get() {
-            true => Vec::new(),
-            false => all.get(),
-        });
-    });
-    screens
 }
 /// A signal-controlled modal portal. Children and fluent styles describe its panel.
 pub fn modal(label: impl Into<String>, open: Signal<bool>) -> View {
@@ -5429,10 +5417,7 @@ fn mount_portal_panel(
         .filter(|_| !top)
         .map(|(_, visible)| visible.clone());
     let portal = crate::compose_modal::create(ui, owner, portal_parent);
-    let screens = match environment.services.get::<PopupsInWindow>() {
-        Some(held) if anchored => held_screens(ui, owner, held),
-        _ => ui.popup_screens(),
-    };
+    let screens = ui.popup_screens();
     let hoist = (view.rare.as_mut())
         .and_then(|r| r.portal.as_mut())
         .and_then(|p| p.hoist.take());
@@ -7803,7 +7788,7 @@ fn open_element(
                 editor.set_line_insets(line_insets);
             }
             if line_marks.is_some() {
-                editor.set_line_marks(line_marks);
+                editor.set_marks_giver(line_marks);
             }
             if highlighter.is_some() {
                 editor.set_span_highlighter(highlighter);
@@ -9160,7 +9145,7 @@ fn mount_image(
         );
     });
 }
-fn fitted_image_size(
+pub(crate) fn fitted_image_size(
     width: f32,
     height: f32,
     source_width: f32,

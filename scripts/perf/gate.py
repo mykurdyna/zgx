@@ -189,6 +189,10 @@ SCENES = [
     # which puts every line below in a block and back.
     ('note-letters', 'zgx-script', 'note_bench', {}),
     ('note-fence', 'zgx-script', 'note_bench', {'SCENE': 'fence'}),
+    # A text area's marks a Rust closure gives (marks_bench): a wash, a rule
+    # and a number beside each of 400 lines, made at each call, scrolled a
+    # line a frame.
+    ('marks-rust', 'zgx-script', 'marks_bench', {}),
     ('style', 'zgx', 'style_bench', {}),
     # A terminal streaming a build log (16, 256 and true colours, styles,
     # wrapping, a progress line rewritten), its output replayed on the
@@ -293,6 +297,14 @@ SCENES = [
     # The same table with its branches as functions (`ui.switch`'s cases,
     # `ui.show`'s rarely shown content): built only when they show.
     ('library-scroll-lazy', 'zgx-script', 'library_scroll_lazy_bench', {}),
+    # A chat transcript of 2,000 steps (messages, Markdown replies drawn by the
+    # script from `ui.markdown`'s blocks, tool calls as cards) in a measured,
+    # following `ui.list`, opened at its end and scrolled back by 120 wheel
+    # events, its text shaped by `TextServices`: the rows coming into view
+    # built from Luau, mounted, laid out and shaped, and their links' boxes
+    # placed. And the same with no links, the rows' own cost apart.
+    ('transcript-scroll', 'zgx-script', 'transcript_scroll_bench', {}),
+    ('transcript-scroll-plain', 'zgx-script', 'transcript_scroll_bench', {'LINKS': '0'}),
     # New text mounting, cold: a word's first shape.
     ('mount-text', 'zgx-script', 'mount_text_bench', {}),
     # An app's cold start: a chat feed decoded from the script's source into
@@ -304,6 +316,18 @@ SCENES = [
     ('startup', 'zgx-script', 'startup_bench', {'N': '1000'}),
     # A reply's token streamed in, a composer keystroke, a switch.
     ('app-chat', 'zgx-script', 'list_state_bench', {'APP': 'chat', 'REPS': '4'}),
+    # A reply streaming into a chat's transcript (md-stream-fade): a measured
+    # list following its end, the reply parsed by `ui.markdown` and drawn by a
+    # `ui.each`, four tokens every third frame, its newest words fading in
+    # with `fade_in` (drawn in Rust). The frames a chunk comes in, and the two
+    # between chunks, where the fade alone runs, counted apart. On a clock
+    # moved 1/60 s a frame (`CLOCK=frames`), so a fade's steps fall on the
+    # same frames in every run; `READS`: a base whose bench doesn't read it
+    # counted on the wall clock, so shows these as new.
+    ('md-stream-fade', 'zgx-script', 'list_state_bench', {'APP': 'stream', 'FADE': 'native', 'COUNT': 'chunk', 'REPS': '40',
+                                                          'CLOCK': 'frames', 'READS': 'CLOCK'}),
+    ('md-stream-fade-between', 'zgx-script', 'list_state_bench', {'APP': 'stream', 'FADE': 'native', 'COUNT': 'between',
+                                                                   'REPS': '40', 'CLOCK': 'frames', 'READS': 'CLOCK'}),
     # A sort with no order kept (the honest whole sort) on its own, as the
     # code editor's new-letter search is.
     ('app-dashboard', 'zgx-script', 'list_state_bench', {'APP': 'dashboard', 'ROWS': '2000', 'REPS': '2',
@@ -348,8 +372,10 @@ SPREAD = {'app-chat': 0.2, '3d-textured': 0.06, '3d-mixed': 0.08, 'spans-md': 0.
 # startup and app-dashboard all but one run in ten). Not every Luau scene:
 # under it list-estimate's runs spread 15,227 instructions (1,319 without)
 # and app-mail's 6,421 (828).
+# md-stream-fade's cells too: on a fixed clock (`Bench::clock`), three runs
+# under it counted alike, and without it a few hundred instructions apart.
 FAIR = ('spans-plain', 'spans-md', 'spans-follow', 'micro-state-luau', 'script-update', 'md-stream', 'md-stream-text',
-        'startup', 'app-dashboard', 'app-dashboard-sort')
+        'startup', 'app-dashboard', 'app-dashboard-sort', 'md-stream-fade', 'md-stream-fade-between')
 # Built apart from the rest, each: see `build`.
 ALONE = ('zgx-3d', 'zgx-video', 'zgx-terminal')
 
@@ -398,11 +424,14 @@ def runs_scene(checkout, env, package=None, example=None):
     measured alone that its `apps.rs` lacks. A scene naming a setting new to
     its bench (`READS`) runs only where the bench's source reads it: an
     older bench would ignore it and count another workload under the name."""
-    if 'READS' in env and package and example:
-        source = checkout / 'crates' / package_in(checkout, package) / 'examples' / f'{example}.rs'
-        if not source.exists() or f'"{env["READS"]}"' not in source.read_text():
-            return False
     apps = checkout / 'crates' / package_in(checkout, 'zgx-script') / 'examples/support/apps.rs'
+    if 'READS' in env and package and example:
+        # An app scene's settings are read by `apps.rs`, its bench's.
+        sources = [checkout / 'crates' / package_in(checkout, package) / 'examples' / f'{example}.rs']
+        if 'APP' in env:
+            sources.append(apps)
+        if not any(s.exists() and f'"{env["READS"]}"' in s.read_text() for s in sources):
+            return False
     if 'APP' not in env:
         return True
     if not apps.exists():
@@ -654,7 +683,7 @@ def by_function(rows, scenes, base, budget=None, clock=time.monotonic, found=Non
         (into / f'{name}.txt').write_text(report + '\n')
         print(f'=== {name} by function\n{report}', flush=True)
         if found is not None:
-            found[name] = (groups, total)
+            found[name] = (groups, total, cgdiff.luau_parts(into / f'{name}.base.cg', into / f'{name}.head.cg'))
         summary.append(f'| {name} | {total:+,} | ' + ' | '.join(f'{groups[g]:+,}' for g in cgdiff.GROUPS) + ' |')
     if not summary:
         return []
@@ -741,10 +770,27 @@ def layout_rows(rows, found, scenes, base, clock=time.monotonic, counted=None, a
     for name, before, after, delta, _ in sorted(rows, key=lambda row: -(row[3] or 0.0)):
         if name not in found or delta is None or not before:
             continue
-        groups, total = found[name]
+        groups, total, *parts = found[name]
         # `other` is mostly Luau's collector's unattributed frames, which move
         # with the heap as libc does: compared by the range, printed below.
         ours = {g: groups[g] for g in ('zgx', 'luau', 'rust') if groups.get(g, 0) > 0}
+        parts = parts[0] if parts else None
+        heap_luau = ''
+        if parts and 'luau' in ours:
+            # Luau's compiler hashes by address, and its tables place keys
+            # hashed so: those move with the heap as libc does, compared by
+            # the range. Its tables only while what calls them (its
+            # interpreter, the C API) did no more: more lookups cost their
+            # callers too.
+            share = lambda part: parts.get(part, 0) / before * 100
+            callers = [p for p in ('interpreter', 'api') if share(p) > LAYOUT_OURS]
+            if callers:
+                ours['luau ' + callers[0]] = parts[callers[0]]
+            moved = ['parse'] + ([] if callers else ['tables'])
+            ours['luau'] = groups['luau'] - sum(parts.get(p, 0) for p in moved)
+            if ours['luau'] <= 0:
+                del ours['luau']
+            heap_luau = ''.join(f', luau {p} {parts[p]:+,}' for p in moved if parts.get(p))
         most = max(ours.values(), default=0) / before * 100
         if total <= 0 or delta <= 0:
             continue
@@ -793,7 +839,8 @@ def layout_rows(rows, found, scenes, base, clock=time.monotonic, counted=None, a
                 own = ', given the change\'s own ' + ', '.join(
                     f'{n} {c:+,} ({b:+,} bytes)' for n, c, b in allocated)
             other = f", other {groups['other']:+,}" if groups.get('other') else ''
-            lines.append((name, delta, f"layout{own}: zgx {groups['zgx']:+,}{other}, the same calls and bytes; {over}"))
+            lines.append((name, delta, f"layout{own}: zgx {groups['zgx']:+,}{other}{heap_luau}, "
+                                       f"the same calls and bytes; {over}"))
     return lines
 
 

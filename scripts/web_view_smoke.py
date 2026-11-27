@@ -37,6 +37,7 @@ on the CPU (`WebViewOptions::accelerated` false) passes the same checks,
 and two dots far apart that it turns green upload as two small parts.
 """
 import argparse
+import base64
 import functools
 import http.server
 import io
@@ -652,6 +653,32 @@ def page_checks(session, ime, transparent=False, unaccelerated=False):
     session.wait(lambda: session.lines("FULL_SCREEN ")[-1:] == ["false"], "the page never left full screen")
     session.wait(lambda: near(session.grab()(*COLOURS["page"][0]), COLOURS["page"][1]), "the page never came back from full screen")
     checks["full screen"] = True
+    # The page's theme colour (its <meta name="theme-color">) and the link
+    # under the pointer reach the app's state.
+    # WebKitGTK reports no theme colour for a page it paints on the CPU
+    # (`accelerated: false`): it never changes `theme-color` there.
+    if not unaccelerated:
+        session.wait(lambda: "#336699ff" in session.lines("THEME "), "the page's theme colour never reached its state")
+        checks["theme colour"] = True
+    session.xdo("mousemove", "--window", session.window, 80, 292)
+    session.wait(lambda: session.lines("HOVERED ")[-1:] == ["https://example.com/dragged"],
+                 "the link under the pointer never reached the page's state")
+    session.xdo("mousemove", "--window", session.window, 705, 130)
+    session.wait(lambda: session.lines("HOVERED ")[-1:] == ["-"], "the hovered link stayed after the pointer left it")
+    checks["hovered link"] = True
+    # Snapshots, straight from the engine: what shows, then the whole
+    # 3000-pixel page, blue where the page is.
+    session.key("ctrl+s")
+    shot = session.wait(lambda: session.lines("SNAPSHOT visible "), "no snapshot of what shows")[0]
+    size, pixel = shot.split(" ")[:2]
+    if pixel != "0,0,255,255" or int(size.split("x")[1]) <= 0:
+        raise AssertionError(f"the snapshot of what shows is {shot!r}")
+    session.key("ctrl+y")
+    shot = session.wait(lambda: session.lines("SNAPSHOT full "), "no snapshot of the whole page")[0]
+    size, pixel = shot.split(" ")[:2]
+    if pixel != "0,0,255,255" or int(size.split("x")[1]) < 3000:
+        raise AssertionError(f"the snapshot of the whole page is {shot!r}")
+    checks["snapshots"] = shot
     if not session.wayland:
         checks["file input"] = file_checks(session)
     # After the damage check: a dialog closing activates the window again,
@@ -670,6 +697,27 @@ def page_checks(session, ime, transparent=False, unaccelerated=False):
         session.click(300, 300, 5)
     scrolled = session.wait(lambda: [m for m in session.messages() if "scrolled" in m[0]], "the wheel never scrolled the page")
     checks["scrolled"] = scrolled[0][0]["scrolled"]
+    # Editing commands: Ctrl+O selects all of the page and copies it, which
+    # reaches the system's clipboard (over a sentinel another client put there).
+    session.clipboard("zgx-sentinel")
+    session.key("ctrl+o")
+    session.wait(lambda: session.lines("EDIT ")[-1:] == ["Ok(())"], "the page took no editing command")
+    copied = session.wait(lambda: (lambda text: text if text and text != "zgx-sentinel" else None)(session.clipboard()),
+                          "select all and copy put nothing on the clipboard")
+    if "Probe heading" not in copied:
+        raise AssertionError(f"copying all of the page gave {copied[:80]!r}")
+    checks["edit commands"] = True
+    # Reloading ignoring the cache loads the page again.
+    finished = len(session.lines("FINISHED "))
+    session.key("ctrl+u")
+    session.wait(lambda: session.lines("RELOAD ")[-1:] == ["Ok(())"], "the page didn't take the reload")
+    session.wait(lambda: len(session.lines("FINISHED ")) > finished, "reloading ignoring the cache loaded nothing")
+    checks["reload ignoring the cache"] = True
+    # A page's icon (a 16 x 16 PNG its <link rel=icon> names, from a local
+    # server: WebKitGTK loads only http(s) icons) reaches the app's state.
+    session.key("ctrl+h")
+    session.wait(lambda: "16x16" in session.lines("FAVICON "), "the page's icon never reached its state", 20)
+    checks["favicon"] = True
     return checks
 
 
@@ -1184,6 +1232,7 @@ def x11(args, output, private):
         downloads(private)
         env["ZGX_WEB_MENU"] = "1"
         env["ZGX_PROBE_SAVE_DIR"] = save_folder(private)
+        env["ZGX_PROBE_ICON_PAGE"] = ICON_PAGE
         ime = None
         if args.ime or args.orca:
             with (output / "dbus.log").open("w") as log:
@@ -1280,6 +1329,7 @@ def wayland(args, output, private):
         downloads(private)
         env["ZGX_WEB_MENU"] = "1"
         env["ZGX_PROBE_SAVE_DIR"] = save_folder(private)
+        env["ZGX_PROBE_ICON_PAGE"] = ICON_PAGE
         # A private session bus: Fcitx5 talks on it, and nothing else starts.
         bus_config = pathlib.Path(private, "dbus.conf")
         bus_config.write_text("<busconfig><type>session</type><listen>unix:tmpdir=" + private + "</listen><auth>EXTERNAL</auth>"
@@ -1370,6 +1420,32 @@ def wayland(args, output, private):
             device.close()
         end(owned)
 
+
+ICON = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAGUlEQVR42mP4z8DwnxLMMGrAqAGjBgwXAwAwxP4QisZM5QAAAABJRU5ErkJggg==")
+
+
+def serve_icon_page():
+    """A page whose <link rel=icon> names a 16 x 16 red PNG beside it, over
+    HTTP on a free localhost port, for the probe's Ctrl+H: its URL."""
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            icon = self.path == "/icon.png"
+            body = ICON if icon else b'<!doctype html><title>icon</title><link rel="icon" href="/icon.png"><body>icon'
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png" if icon else "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{server.server_address[1]}/"
+
+
+ICON_PAGE = serve_icon_page()
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

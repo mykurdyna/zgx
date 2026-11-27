@@ -556,3 +556,250 @@ fn a_paragraph_watches_its_box_only_once_it_has_a_link() {
         "the link's box follows its words as their line narrows: {wide:?} then {narrow:?}"
     );
 }
+
+/// Each width a rich paragraph was shaped at for its links' geometry
+/// (`set_rich_text_shaper`), shaping as the fallback layout does.
+fn widths_shaped(ui: &Ui) -> Rc<RefCell<Vec<Option<f32>>>> {
+    let widths = Rc::new(RefCell::new(Vec::new()));
+    let seen = widths.clone();
+    ui.scene
+        .borrow_mut()
+        .set_rich_text_shaper(move |rich, width| {
+            seen.borrow_mut().push(width);
+            Box::new(zgx::text_layout::FallbackTextLayout::with_rich(rich, width))
+        });
+    widths
+}
+
+/// The rich paragraph under `id`, depth first.
+fn paragraph_under(ui: &Ui, id: NodeId) -> Option<NodeId> {
+    let scene = ui.scene.borrow();
+    if matches!(scene.kind(id), zgx::scene::NodeKind::RichText { .. }) {
+        return Some(id);
+    }
+    let children = scene.children(id).to_vec();
+    drop(scene);
+    children
+        .into_iter()
+        .find_map(|child| paragraph_under(ui, child))
+}
+
+/// A link's boxes where they show: its own (what a screen reader's bounds
+/// are) and each further line's.
+fn link_rects(ui: &Ui, link: NodeId) -> Vec<zgx::scene::Rect> {
+    let scene = ui.scene.borrow();
+    let mut rects = vec![scene.bounds(link)];
+    rects.extend(scene.children(link).iter().map(|&line| scene.bounds(line)));
+    rects
+}
+
+/// Where the link's words are, shaped afresh at the paragraph's width.
+fn words_at(ui: &Ui, paragraph: NodeId, range: std::ops::Range<usize>) -> Vec<zgx::scene::Rect> {
+    use zgx::text_layout::TextLayout;
+    let scene = ui.scene.borrow();
+    let bounds = scene.bounds(paragraph);
+    let zgx::scene::NodeKind::RichText { text } = scene.kind(paragraph) else {
+        panic!("not a paragraph");
+    };
+    let layout = zgx::text_layout::FallbackTextLayout::with_rich(text, Some(bounds.width));
+    layout
+        .selection(range)
+        .into_iter()
+        .filter_map(|r| r.intersection(zgx::scene::Rect::new(0., 0., bounds.width, bounds.height)))
+        .filter(|r| r.width > 0. && r.height > 0.)
+        .map(|r| zgx::scene::Rect::new(bounds.x + r.x, bounds.y + r.y, r.width, r.height))
+        .collect()
+}
+
+#[test]
+fn a_links_boxes_follow_its_words_from_first_layout_and_none_are_shaped_before() {
+    let mut ui = Ui::new(600., 400.);
+    let shaped = widths_shaped(&ui);
+    let width = ui.signal(400_f32);
+    let height = ui.signal(60_f32);
+    let (read_width, read_height) = (width.clone(), height.clone());
+    let words = "Read the docs for the details of the layout below.";
+    let _mounted = ui.mount(
+        column().child(
+            rich_text_signal(move || {
+                vec![
+                    text_span("Start: "),
+                    text_span(words).href("https://example.org/docs"),
+                ]
+            })
+            .text_wrap(true)
+            .reactive_style(move || Styles::new().w(read_width.get()).h(read_height.get())),
+        ),
+    );
+    let range = "Start: ".len().."Start: ".len() + words.len();
+    let check = |ui: &mut Ui, when: &str| {
+        let root = ui.scene.borrow().root();
+        let paragraph = paragraph_under(ui, root).expect("the paragraph");
+        let link = links(ui)[0];
+        let rects = link_rects(ui, link);
+        assert_eq!(
+            rects,
+            words_at(ui, paragraph, range.clone()),
+            "{when}: the link's boxes are its words"
+        );
+        assert!(!rects.is_empty() && rects[0].width > 0., "{when}: placed");
+        for r in &rects {
+            let (x, y) = (r.x + r.width / 2., r.y + r.height / 2.);
+            let hit = ui.scene.borrow().hit_test(x, y);
+            assert!(
+                hit == Some(link) || hit.is_some_and(|h| ui.scene.borrow().parent(h) == Some(link)),
+                "{when}: {r:?}'s middle hits the link, not {hit:?}"
+            );
+            ui.dispatch(InputEvent::PointerMove { x, y });
+            ui.prepare_frame();
+            let hovered = ui.input.hovered();
+            assert!(
+                hovered == Some(link)
+                    || hovered.is_some_and(|h| ui.scene.borrow().parent(h) == Some(link)),
+                "{when}: the pointer over {r:?} is over the link, not {hovered:?}"
+            );
+        }
+        // Away again: a hovered link's ring is the next step's to show or not.
+        ui.dispatch(InputEvent::PointerMove { x: 590., y: 390. });
+        ui.prepare_frame();
+        rects
+    };
+    ui.prepare_frame();
+    ui.scene.borrow_mut().flush();
+    assert!(
+        !shaped.borrow().contains(&Some(0.)),
+        "nothing shaped for links' boxes before the paragraph had a size: {:?}",
+        shaped.borrow()
+    );
+    let wide = check(&mut ui, "laid out");
+    width.set(120.);
+    ui.prepare_frame();
+    ui.scene.borrow_mut().flush();
+    let narrow = check(&mut ui, "narrowed");
+    assert!(
+        narrow.len() > wide.len(),
+        "its words wrap onto more lines: {wide:?} then {narrow:?}"
+    );
+    height.set(140.);
+    ui.prepare_frame();
+    ui.scene.borrow_mut().flush();
+    assert_eq!(
+        check(&mut ui, "taller"),
+        narrow,
+        "a taller paragraph moves no word"
+    );
+}
+
+#[test]
+fn a_links_boxes_come_from_the_lines_laid_out_where_its_host_says() {
+    use zgx::text_layout::TextLayout;
+    let mut ui = Ui::new(600., 400.);
+    let shaped = widths_shaped(&ui);
+    let asked = Rc::new(RefCell::new(0));
+    let count = asked.clone();
+    ui.scene
+        .borrow_mut()
+        .set_rich_text_selection(move |rich, width, ranges| {
+            *count.borrow_mut() += 1;
+            let layout = zgx::text_layout::FallbackTextLayout::with_rich(rich, width);
+            ranges
+                .iter()
+                .map(|range| layout.selection(range.clone()))
+                .collect()
+        });
+    let width = ui.signal(400_f32);
+    let read_width = width.clone();
+    let words = "Read the docs for the details of the layout below.";
+    let _mounted = ui.mount(
+        column().child(
+            rich_text_signal(move || {
+                vec![
+                    text_span("Start: "),
+                    text_span(words).href("https://example.org/docs"),
+                ]
+            })
+            .text_wrap(true)
+            .reactive_style(move || Styles::new().w(read_width.get())),
+        ),
+    );
+    let range = "Start: ".len().."Start: ".len() + words.len();
+    for (step, w) in [(1, 400.), (2, 120.)] {
+        width.set(w);
+        ui.prepare_frame();
+        ui.scene.borrow_mut().flush();
+        let root = ui.scene.borrow().root();
+        let paragraph = paragraph_under(&ui, root).expect("the paragraph");
+        let link = links(&ui)[0];
+        assert_eq!(
+            link_rects(&ui, link),
+            words_at(&ui, paragraph, range.clone()),
+            "at {w}"
+        );
+        assert_eq!(*asked.borrow(), step, "asked once a width, at {w}");
+    }
+    assert_eq!(*shaped.borrow(), [], "nothing shaped for the links' boxes");
+}
+
+#[test]
+fn a_links_ring_moves_none_of_its_boxes() {
+    let mut ui = Ui::new(600., 400.);
+    let words = "Read the docs for the details of the layout below.";
+    let _mounted = ui.mount(
+        column().child(
+            rich_text_signal(move || {
+                vec![
+                    text_span("Start: "),
+                    text_span(words).href("https://example.org/docs"),
+                ]
+            })
+            .text_wrap(true)
+            .reactive_style(|| Styles::new().w(120.)),
+        ),
+    );
+    ui.prepare_frame();
+    ui.scene.borrow_mut().flush();
+    let range = "Start: ".len().."Start: ".len() + words.len();
+    let root = ui.scene.borrow().root();
+    let paragraph = paragraph_under(&ui, root).expect("the paragraph");
+    let link = links(&ui)[0];
+    let ring = |ui: &Ui| match ui.scene.borrow().kind(link) {
+        zgx::scene::NodeKind::Panel { quad, .. } => quad.border_width,
+        // Not yet hovered or focused: no ring made.
+        zgx::scene::NodeKind::Container(_) => 0.,
+        other => panic!("a link's box, not {other:?}"),
+    };
+    let rest = link_rects(&ui, link);
+    assert!(rest.len() > 2, "its words on several lines: {rest:?}");
+    assert_eq!(rest, words_at(&ui, paragraph, range.clone()));
+    assert_eq!(ring(&ui), 0.);
+    // Under the pointer, then focused from the keyboard: its ring shows,
+    // and every box stays on its words.
+    let first = rest[0];
+    ui.dispatch(InputEvent::PointerMove {
+        x: first.x + first.width / 2.,
+        y: first.y + first.height / 2.,
+    });
+    ui.prepare_frame();
+    ui.scene.borrow_mut().flush();
+    assert_eq!(ring(&ui), 1., "hovered: its ring");
+    assert_eq!(
+        link_rects(&ui, link),
+        rest,
+        "hovered: its boxes where they were"
+    );
+    ui.dispatch(InputEvent::PointerMove { x: 590., y: 390. });
+    ui.dispatch(InputEvent::KeyDown {
+        key: Key::Tab,
+        modifiers: Modifiers::default(),
+        repeat: false,
+    });
+    ui.prepare_frame();
+    ui.scene.borrow_mut().flush();
+    assert_eq!(ui.input.focused(), Some(link));
+    assert_eq!(ring(&ui), 1., "tabbed to: its ring");
+    assert_eq!(
+        link_rects(&ui, link),
+        rest,
+        "focused: its boxes where they were"
+    );
+}

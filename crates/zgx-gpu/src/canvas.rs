@@ -18,6 +18,8 @@ const MAX_ENTRIES: usize = 1024;
 struct Entry {
     canvas: Weak<Canvas>,
     decoration: Option<zgx::scene::QuadStyle>,
+    /// What `decoration`'s corners were drawn on.
+    curve: zgx::decoration::CornerCurve,
     width: f32,
     height: f32,
     scale: f32,
@@ -48,7 +50,7 @@ struct Panned {
 /// Where a panned raster shows in its canvas's box: `rect` (x, y, width,
 /// height, in points from the box's corner; empty for nothing) and the part
 /// of the raster drawn there, `uv` (x, y, width, height, from 0 to 1).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Placement {
     /// Where in the box, in points.
     pub rect: [f32; 4],
@@ -697,6 +699,31 @@ impl Panned {
         }
     }
 }
+/// How much coarser than the display a canvas past the budget may draw:
+/// past that it would draw nothing worth seeing.
+const MOST_COARSE: f64 = 8.;
+/// The scale, and `region` at it, a canvas region past the budget at `scale`
+/// is drawn at: the finest within `REGION_PIXELS`. `None`: none down to
+/// `MOST_COARSE` is.
+#[cold]
+fn coarser(scale: f32, region: [i32; 4]) -> Option<(f32, [i32; 4])> {
+    // (Whole pixels out, so a little less than the areas' ratio: a few tries.)
+    let mut by = (REGION_PIXELS as f64 / area(region) as f64).sqrt();
+    while by >= 1. / MOST_COARSE {
+        let [x0, y0, x1, y1] = region.map(|v| f64::from(v) * by);
+        let at = [
+            x0.floor() as i32,
+            y0.floor() as i32,
+            x1.ceil() as i32,
+            y1.ceil() as i32,
+        ];
+        if area(at) <= REGION_PIXELS {
+            return Some(((f64::from(scale) * by) as f32, at));
+        }
+        by *= 0.999;
+    }
+    None
+}
 /// The `region` (x0, y0, x1, y1, in its box's device pixels) of `canvas`
 /// under `view` at `scale`, its pixels where `old` (the region `pixels`
 /// hold) has them taken from there: only what is new is rasterized.
@@ -713,7 +740,11 @@ fn rasterize_region(
         return ImageData::new(1, 1, vec![0; 4]).map_err(|e| GpuError(e.into()));
     }
     if area(region) > REGION_PIXELS {
-        return Err(GpuError("canvas raster exceeds 32 MiB".into()));
+        // Past the budget it is drawn coarser (fewer pixels, stretched over
+        // its box) rather than not at all.
+        let (scale, region) = coarser(scale, region)
+            .ok_or_else(|| GpuError("canvas raster exceeds 32 MiB".into()))?;
+        return rasterize_region(canvas, view, scale, region, None, text);
     }
     let [x0, y0, x1, y1] = region;
     let (w, h) = ((x1 - x0) as usize, (y1 - y0) as usize);
@@ -766,7 +797,11 @@ fn rasterize_region(
             }
         }
     };
+    // (Drawn coarser, its pixels aren't `at`'s: none is kept.)
     let kept = old
+        .filter(|([ax, ay, bx, by], pixels)| {
+            (bx - ax) as u32 == pixels.width() && (by - ay) as u32 == pixels.height()
+        })
         .map(|(at, pixels)| (intersect(at, region), at, pixels))
         .filter(|(both, ..)| !is_empty(*both));
     let Some((both, at, pixels)) = kept else {
@@ -841,6 +876,10 @@ pub struct CanvasCache {
     /// What uploading a tile's texture takes, in ms, and the frame whose
     /// uploads it last counted, with the ms they took (`tile_uploaded`).
     uploads: (f32, u64, f32, usize),
+    /// Canvases that didn't draw, said by the renderer (`take_issues`).
+    issues: Vec<String>,
+    /// What one that didn't draw is drawn with: a pixel, placed nowhere.
+    nothing: Option<Arc<ImageData>>,
 }
 impl CanvasCache {
     /// Draw the text of canvases that draw it into their raster
@@ -928,6 +967,17 @@ impl CanvasCache {
             self.retain_pyramids(|id| id != node);
         }
     }
+    /// Forget the rasters drawn on a curve other than the circle.
+    #[cold]
+    pub(crate) fn forget_curved(&mut self) {
+        let curved: Vec<NodeId> = (self.entries.iter())
+            .filter(|(_, entry)| entry.curve != zgx::decoration::CornerCurve::Circular)
+            .map(|(node, _)| *node)
+            .collect();
+        for node in curved {
+            self.forget(node);
+        }
+    }
     /// How many rasterizations it has done.
     pub fn rasterizations(&self) -> u64 {
         self.rasterizations
@@ -961,6 +1011,37 @@ impl CanvasCache {
         let image = self.get(node, &canvas, width, height, scale)?;
         if let Some(entry) = self.entries.get_mut(&node) {
             entry.decoration = Some(style.clone());
+        }
+        Ok(image)
+    }
+    /// `get_decoration`, its corners on `curve`: for frames of scenes with
+    /// continuous corners. (`forget_curved` drops what it drew on another
+    /// curve, for `get_decoration` once none are left.)
+    pub(crate) fn get_decoration_on(
+        &mut self,
+        node: NodeId,
+        style: &zgx::scene::QuadStyle,
+        curve: zgx::decoration::CornerCurve,
+        width: f32,
+        height: f32,
+        scale: f32,
+    ) -> Result<Raster, GpuError> {
+        self.clock = self.clock.wrapping_add(1);
+        if let Some(entry) = self.entries.get_mut(&node)
+            && entry.decoration.as_ref() == Some(style)
+            && entry.curve == curve
+            && entry.width == width
+            && entry.height == height
+            && entry.scale == scale
+        {
+            entry.used = self.clock;
+            return Ok(entry.raster());
+        }
+        let canvas = Arc::new(crate::decoration::canvas_on(style, curve, width, height)?);
+        let image = self.get(node, &canvas, width, height, scale)?;
+        if let Some(entry) = self.entries.get_mut(&node) {
+            entry.decoration = Some(style.clone());
+            entry.curve = curve;
         }
         Ok(image)
     }
@@ -1014,8 +1095,51 @@ impl CanvasCache {
     /// shows, as `get_viewed` does. So does a zoom if `wait`; else the
     /// raster of the zoom before shows scaled (`Placement::scaled`) while
     /// this zoom's is made off the frame, and is swapped for it once made.
+    ///
+    /// A canvas that won't draw (too many commands or clips, or past the
+    /// budget at an eighth of the display's scale) is placed nowhere, and
+    /// said once (`take_issues`): its fault, not the frame's. A lost device
+    /// is the frame's.
     #[allow(clippy::too_many_arguments)]
     pub fn get_panned(
+        &mut self,
+        node: NodeId,
+        canvas: &Arc<Canvas>,
+        view: zgx::scene::CanvasView,
+        width: f32,
+        height: f32,
+        scale: f32,
+        wait: bool,
+    ) -> Result<(Raster, Placement), GpuError> {
+        match self.panned(node, canvas, view, width, height, scale, wait) {
+            Err(error) if !error.is_device_lost() => Ok(self.drew_nothing(error)),
+            done => done,
+        }
+    }
+    /// `get_panned` for a canvas that didn't draw: nothing, said.
+    #[cold]
+    #[inline(never)]
+    fn drew_nothing(&mut self, error: GpuError) -> (Raster, Placement) {
+        self.issues
+            .push(format!("a canvas doesn't draw: {}", error.0));
+        let nothing = self
+            .nothing
+            .get_or_insert_with(|| Arc::new(ImageData::new(1, 1, vec![0; 4]).expect("a pixel")))
+            .clone();
+        (
+            Raster {
+                id: nothing.id(),
+                pixels: Some(nothing),
+            },
+            Placement::default(),
+        )
+    }
+    /// Canvases that didn't draw since last asked, each a sentence.
+    pub(crate) fn take_issues(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.issues)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn panned(
         &mut self,
         node: NodeId,
         canvas: &Arc<Canvas>,
@@ -1450,6 +1574,7 @@ impl CanvasCache {
             Entry {
                 canvas: Arc::downgrade(canvas),
                 decoration: None,
+                curve: Default::default(),
                 width,
                 height,
                 scale,
@@ -3376,5 +3501,25 @@ mod gradient_tests {
         let nan = Affine::translation(f32::NAN, 0.);
         assert!(Brush::conic(nan, stops(&[RED, BLUE])).is_err());
         assert!(Brush::radial(Affine::IDENTITY, stops(&[RED])).is_err());
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    #[test]
+    fn a_region_past_the_budget_is_drawn_coarser_not_refused() {
+        // A long map (the canvas that skipped a window's frames): 1044 by
+        // 6356 points at 2x is 101 MiB of pixels.
+        let (scale, at) = coarser(2., [0, 0, 2088, 12712]).unwrap();
+        assert!(area(at) <= REGION_PIXELS, "{at:?}");
+        assert!(scale > 1., "as fine as fits: {scale}");
+        let ratio = (at[2] as f32 / at[3] as f32) / (2088. / 12712.);
+        assert!((ratio - 1.).abs() < 0.01, "keeps its shape: {at:?}");
+        // Not from its box's corner, and thin.
+        let (_, at) = coarser(1., [-3, 5, 7, 4_000_000]).unwrap();
+        assert!(area(at) <= REGION_PIXELS && at[0] < 0 && at[2] > at[0]);
+        // Coarser than an eighth of the display's scale: refused.
+        assert_eq!(coarser(1., [0, 0, 100_000, 100_000]), None);
     }
 }

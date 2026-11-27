@@ -89,6 +89,49 @@ pub(crate) fn available() -> bool {
     })
 }
 
+/// The number after `"key":` in `json` (DevTools' answers, read without a
+/// parser).
+fn json_number(json: &str, key: &str) -> Option<f64> {
+    let rest = json.split(&format!("\"{key}\":")).nth(1)?;
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | 'e' | 'E' | '+')))
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+/// `Page.captureScreenshot`'s answer, `{"data":"<base64 PNG>"}`, decoded.
+fn snapshot_png(json: &str) -> zgx::web_view::SnapshotResult {
+    let data = json
+        .split("\"data\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .ok_or("WebView2's snapshot had no data")?;
+    let png = base64_decode(data).ok_or("WebView2's snapshot wasn't base64")?;
+    zgx_gpu::assets::decode_image(&png).map_err(|error| error.to_string())
+}
+/// Standard base64 (with or without padding), `None` if it isn't.
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let (mut bits, mut count) = (0u32, 0);
+    for c in text.bytes() {
+        let value = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            b'\\' | b'\n' | b'\r' => continue,
+            _ => return None,
+        };
+        bits = bits << 6 | u32::from(value);
+        count += 6;
+        if count >= 8 {
+            count -= 8;
+            out.push((bits >> count) as u8);
+        }
+    }
+    Some(out)
+}
 fn take(get: impl FnOnce(*mut PWSTR) -> windows::core::Result<()>) -> String {
     let mut value = PWSTR::null();
     match get(&mut value) {
@@ -443,6 +486,24 @@ pub(crate) struct Page {
 
 /// The `WebViewBackend` of a page (its `as_any` finds the page).
 pub(crate) struct Backend(pub Rc<Page>);
+impl Backend {
+    /// Call a DevTools method on the page, its answer unread.
+    fn devtools(&self, method: &str, params: String) -> std::result::Result<(), String> {
+        let ready = self.0.ready.borrow();
+        let Some(ready) = ready.as_ref() else {
+            return Err("the web view isn't showing yet".into());
+        };
+        // SAFETY: WebView2 on the UI thread.
+        unsafe {
+            ready.view.CallDevToolsProtocolMethod(
+                &HSTRING::from(method),
+                &HSTRING::from(params),
+                &CallDevToolsProtocolMethodCompletedHandler::create(Box::new(|_, _| Ok(()))),
+            )
+        }
+        .map_err(|error| error.message())
+    }
+}
 impl WebViewBackend for Backend {
     fn run(&self, command: WebViewCommand) {
         // Queued until its scripts are in: then in order.
@@ -532,6 +593,114 @@ impl WebViewBackend for Backend {
     /// a request to the host would carry (its own and its parent domains',
     /// which a browser never sets on a public suffix) one by one. Another
     /// subdomain's storage, and cookies one set for itself alone, stay.
+    fn edit(&self, command: zgx::web_view::EditCommand) -> std::result::Result<(), String> {
+        use zgx::web_view::EditCommand;
+        // Chromium's editing commands, which DevTools sends with a key event
+        // (WebView2 has no call of its own for them).
+        let name = match command {
+            EditCommand::Copy => "copy",
+            EditCommand::Cut => "cut",
+            EditCommand::Paste => "paste",
+            EditCommand::SelectAll => "selectAll",
+            EditCommand::Undo => "undo",
+            EditCommand::Redo => "redo",
+            _ => return Err("WebView2 has no such editing command".into()),
+        };
+        self.devtools(
+            "Input.dispatchKeyEvent",
+            format!(r#"{{"type":"rawKeyDown","commands":["{name}"]}}"#),
+        )
+    }
+    fn reload_ignoring_cache(&self) -> std::result::Result<(), String> {
+        self.devtools("Page.reload", r#"{"ignoreCache":true}"#.into())
+    }
+    fn snapshot(
+        &self,
+        area: zgx::web_view::SnapshotArea,
+        reply: Box<dyn FnOnce(zgx::web_view::SnapshotResult)>,
+    ) {
+        let ready = self.0.ready.borrow();
+        let Some(ready) = ready.as_ref() else {
+            return reply(Err("the web view isn't showing yet".into()));
+        };
+        let view = ready.view.clone();
+        let reply = Rc::new(Cell::new(Some(reply)));
+        let answer = {
+            let reply = reply.clone();
+            move |result: zgx::web_view::SnapshotResult| {
+                if let Some(reply) = reply.take() {
+                    reply(result);
+                }
+            }
+        };
+        // DevTools' screenshot: what shows, or (after asking the page's size)
+        // the whole document, rendered beyond the viewport.
+        let capture =
+            move |view: &ICoreWebView2,
+                  params: String,
+                  answer: Rc<dyn Fn(zgx::web_view::SnapshotResult)>| {
+                // SAFETY: WebView2 on the UI thread, where it calls back.
+                let called = unsafe {
+                    view.CallDevToolsProtocolMethod(
+                        &HSTRING::from("Page.captureScreenshot"),
+                        &HSTRING::from(params),
+                        &CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+                            move |result, json| {
+                                answer(
+                                    result
+                                        .map_err(|error| error.message())
+                                        .and_then(|()| snapshot_png(&json)),
+                                );
+                                Ok(())
+                            },
+                        )),
+                    )
+                };
+                if let Err(error) = called {
+                    eprintln!("zgx: WebView2 snapshot: {}", error.message());
+                }
+            };
+        let answer: Rc<dyn Fn(zgx::web_view::SnapshotResult)> = Rc::new(answer);
+        match area {
+            zgx::web_view::SnapshotArea::Visible => {
+                capture(&view, r#"{"format":"png"}"#.into(), answer);
+            }
+            zgx::web_view::SnapshotArea::FullPage => {
+                let page_view = view.clone();
+                // SAFETY: as above.
+                let called = unsafe {
+                    view.CallDevToolsProtocolMethod(
+                        &HSTRING::from("Page.getLayoutMetrics"),
+                        &HSTRING::from("{}"),
+                        &CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+                            move |result, json| {
+                                let size = result.ok().and_then(|()| {
+                                    let content = json.split("\"cssContentSize\"").nth(1)?;
+                                    Some((json_number(content, "width")?, json_number(content, "height")?))
+                                });
+                                match size {
+                                    Some((width, height)) => capture(
+                                        &page_view,
+                                        format!(
+                                            r#"{{"format":"png","captureBeyondViewport":true,"clip":{{"x":0,"y":0,"width":{width},"height":{height},"scale":1}}}}"#
+                                        ),
+                                        answer.clone(),
+                                    ),
+                                    None => answer(Err("WebView2 gave no size for the page".into())),
+                                }
+                                Ok(())
+                            },
+                        )),
+                    )
+                };
+                if let Err(error) = called
+                    && let Some(reply) = reply.take()
+                {
+                    reply(Err(error.message()));
+                }
+            }
+        }
+    }
     fn clear_site_data(&self, url: &str, done: SiteAnswer) {
         let Some(host) = zgx::web_view::site_host(url) else {
             return done(Err(format!("{url} has no site")));
@@ -1165,6 +1334,80 @@ impl Page {
                 })),
                 &mut token,
             );
+            // The status bar's text (hidden above) is the link under the
+            // pointer: the page's hovered link.
+            if let Ok(view) = view.cast::<ICoreWebView2_12>() {
+                let page = on.clone();
+                let _ = view.add_StatusBarTextChanged(
+                    &StatusBarTextChangedEventHandler::create(Box::new(move |sender, _| {
+                        let text = sender
+                            .and_then(|sender| sender.cast::<ICoreWebView2_12>().ok())
+                            .map(|view| take(|v| view.StatusBarText(v)))
+                            .unwrap_or_default();
+                        let link = (!text.is_empty()).then_some(text);
+                        page(&|page| {
+                            let link = link.clone();
+                            page.post(move |web| {
+                                web.update_state(|state| state.hovered_link = link)
+                            });
+                        });
+                        Ok(())
+                    })),
+                    &mut token,
+                );
+            }
+            // The page's icon, where the app shows it (`favicons`): WebView2
+            // says it changed, then hands it over as a PNG.
+            if options.favicons
+                && let Ok(view) = view.cast::<ICoreWebView2_15>()
+            {
+                let page = on.clone();
+                let _ = view.add_FaviconChanged(
+                    &FaviconChangedEventHandler::create(Box::new(move |sender, _| {
+                        let Some(sender) =
+                            sender.and_then(|sender| sender.cast::<ICoreWebView2_15>().ok())
+                        else {
+                            return Ok(());
+                        };
+                        let page = page.clone();
+                        let _ = sender.GetFavicon(
+                            COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG,
+                            &GetFaviconCompletedHandler::create(Box::new(move |result, stream| {
+                                let mut png = Vec::new();
+                                if let (Ok(()), Some(stream)) = (result, stream) {
+                                    let mut chunk = [0u8; 16 * 1024];
+                                    loop {
+                                        let mut read = 0u32;
+                                        let done = stream.Read(
+                                            chunk.as_mut_ptr() as *mut c_void,
+                                            chunk.len() as u32,
+                                            Some(&mut read),
+                                        );
+                                        if done.is_err() || read == 0 {
+                                            break;
+                                        }
+                                        png.extend_from_slice(&chunk[..read as usize]);
+                                    }
+                                }
+                                // An empty stream: the page has no icon.
+                                let favicon = (!png.is_empty())
+                                    .then(|| zgx_gpu::assets::decode_image(&png).ok())
+                                    .flatten();
+                                page(&|page| {
+                                    let favicon = favicon.clone();
+                                    page.post(move |web| {
+                                        web.update_state(|state| state.favicon = favicon);
+                                        web.emit(WebViewEvent::FaviconChanged);
+                                    });
+                                });
+                                Ok(())
+                            })),
+                        );
+                        Ok(())
+                    })),
+                    &mut token,
+                );
+            }
             // A download is the app's (`WebView::download`): saved where
             // it says, or cancelled, as with no handler. WebView2's own
             // download bar stays hidden.
@@ -1278,19 +1521,46 @@ impl Page {
             let _ = view.add_ProcessFailed(
                 &ProcessFailedEventHandler::create(Box::new(move |_, args| {
                     let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
+                    let mut reason = COREWEBVIEW2_PROCESS_FAILED_REASON::default();
                     if let Some(args) = args {
                         let _ = args.ProcessFailedKind(&mut kind);
+                        if let Ok(args) = args.cast::<ICoreWebView2ProcessFailedEventArgs2>() {
+                            let _ = args.Reason(&mut reason);
+                        }
+                    }
+                    // A renderer that stopped answering still runs: the page
+                    // is unresponsive, not ended.
+                    if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE {
+                        page(&|page| {
+                            page.post(|web| {
+                                web.update_state(|state| state.unresponsive = true);
+                                web.emit(WebViewEvent::Unresponsive);
+                            });
+                        });
+                        return Ok(());
                     }
                     let ended = kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED
-                        || kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED
-                        || kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE;
+                        || kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED;
+                    let termination = if reason == COREWEBVIEW2_PROCESS_FAILED_REASON_CRASHED {
+                        zgx::web_view::Termination::Crashed
+                    } else if reason == COREWEBVIEW2_PROCESS_FAILED_REASON_OUT_OF_MEMORY {
+                        zgx::web_view::Termination::OutOfMemory
+                    } else if reason == COREWEBVIEW2_PROCESS_FAILED_REASON_TERMINATED
+                        || reason == COREWEBVIEW2_PROCESS_FAILED_REASON_UNRESPONSIVE
+                    {
+                        zgx::web_view::Termination::Killed
+                    } else {
+                        zgx::web_view::Termination::Unknown
+                    };
                     if ended {
                         page(&|page| {
                             page.loading.set(false);
-                            page.post(|web| {
+                            page.post(move |web| {
                                 web.update_state(|state| {
                                     state.loading = false;
                                     state.error = Some("The page stopped responding.".into());
+                                    state.termination = Some(termination);
+                                    state.unresponsive = false;
                                 });
                                 web.emit(WebViewEvent::ProcessTerminated);
                             });

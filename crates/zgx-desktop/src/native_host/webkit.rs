@@ -155,6 +155,88 @@ fn full_screen_key(view: &WKWebView) -> Option<&'static &'static str> {
     let has: bool = unsafe { msg_send![view, respondsToSelector: sel!(fullscreenState)] };
     has.then_some(&"fullscreenState")
 }
+/// A snapshot's pixels: `image` drawn at `scale` into an RGBA bitmap of our
+/// own (premultiplied, as AppKit's bitmaps are).
+fn snapshot_pixels(image: &objc2_app_kit::NSImage, scale: f64) -> zgx::web_view::SnapshotResult {
+    let size = image.size();
+    let (width, height) = (
+        (size.width * scale).round() as isize,
+        (size.height * scale).round() as isize,
+    );
+    if width <= 0 || height <= 0 {
+        return Err("the snapshot is empty".into());
+    }
+    // SAFETY: AppKit on the main thread: a bitmap rep owning its buffer
+    // (`width * 4` bytes a row, 8-bit RGBA), drawn into through a graphics
+    // context of its own, which is restored before reading the buffer.
+    unsafe {
+        let rep: Option<Retained<objc2_app_kit::NSBitmapImageRep>> = msg_send![
+            objc2_app_kit::NSBitmapImageRep::alloc(),
+            initWithBitmapDataPlanes: std::ptr::null_mut::<*mut u8>(),
+            pixelsWide: width,
+            pixelsHigh: height,
+            bitsPerSample: 8isize,
+            samplesPerPixel: 4isize,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: &*NSString::from_str("NSDeviceRGBColorSpace"),
+            bytesPerRow: width * 4,
+            bitsPerPixel: 32isize
+        ];
+        let Some(rep) = rep else {
+            return Err("AppKit made no bitmap for the snapshot".into());
+        };
+        let context: Option<Retained<AnyObject>> = msg_send![
+            objc2::class!(NSGraphicsContext),
+            graphicsContextWithBitmapImageRep: &*rep
+        ];
+        let _: () = msg_send![objc2::class!(NSGraphicsContext), saveGraphicsState];
+        let _: () =
+            msg_send![objc2::class!(NSGraphicsContext), setCurrentContext: context.as_deref()];
+        let target = NSRect::new(
+            objc2_foundation::NSPoint::new(0., 0.),
+            objc2_foundation::NSSize::new(width as f64, height as f64),
+        );
+        // NSCompositingOperationCopy, the whole image.
+        let _: () = msg_send![
+            image,
+            drawInRect: target,
+            fromRect: NSRect::ZERO,
+            operation: 1usize,
+            fraction: 1f64
+        ];
+        let _: () = msg_send![objc2::class!(NSGraphicsContext), restoreGraphicsState];
+        let data: *mut u8 = msg_send![&*rep, bitmapData];
+        if data.is_null() {
+            return Err("the snapshot's bitmap has no pixels".into());
+        }
+        let bytes = std::slice::from_raw_parts(data, (width * height * 4) as usize).to_vec();
+        zgx::image::ImageData::new_premultiplied(width as u32, height as u32, bytes)
+            .map(std::sync::Arc::new)
+            .map_err(|_| "the snapshot had no pixels".into())
+    }
+}
+/// `themeColor` where WebKit has it (macOS 12), to observe.
+fn theme_color_key(view: &WKWebView) -> Option<&'static &'static str> {
+    // SAFETY: `respondsToSelector:` on the main thread.
+    let has: bool = unsafe { msg_send![view, respondsToSelector: sel!(themeColor)] };
+    has.then_some(&"themeColor")
+}
+/// The page's theme colour (`<meta name="theme-color">`), in sRGB.
+fn theme_color(view: &WKWebView) -> Option<zgx::scene::Color> {
+    theme_color_key(view)?;
+    // SAFETY: WKWebView's `themeColor` (an NSColor or nil) where it has it,
+    // converted on the main thread.
+    let color: Option<Retained<NSColor>> = unsafe { msg_send![view, themeColor] };
+    let srgb = color?.colorUsingColorSpace(&objc2_app_kit::NSColorSpace::sRGBColorSpace())?;
+    let channel = |value: f64| (value.clamp(0., 1.) * 255.).round() as u8;
+    Some(zgx::scene::Color(
+        channel(srgb.redComponent()),
+        channel(srgb.greenComponent()),
+        channel(srgb.blueComponent()),
+        channel(srgb.alphaComponent()),
+    ))
+}
 /// An element of the page is full screen, or going to be.
 fn full_screen(view: &WKWebView) -> bool {
     if full_screen_key(view).is_none() {
@@ -399,6 +481,8 @@ define_class!(
                 web.update_state(|state| {
                     state.loading = false;
                     state.error = Some("The page stopped responding.".into());
+                    // WebKit doesn't say why.
+                    state.termination = Some(zgx::web_view::Termination::Unknown);
                 });
                 web.emit(WebViewEvent::ProcessTerminated);
             });
@@ -785,6 +869,7 @@ impl Observer {
         };
         let lists = history.then(|| self::history(&view));
         let full_screen = full_screen(&view);
+        let theme_color = theme_color(&view);
         self.post(move |web| {
             let (old_url, old_title) = web
                 .state()
@@ -799,6 +884,7 @@ impl Observer {
                 state.can_go_back = back;
                 state.can_go_forward = forward;
                 state.full_screen = full_screen;
+                state.theme_color = theme_color;
                 if let Some((back_list, forward_list)) = lists {
                     state.back_list = back_list;
                     state.forward_list = forward_list;
@@ -1120,7 +1206,11 @@ impl MacWebView {
             view.setNavigationDelegate(Some(ProtocolObject::from_ref(&*observer)));
             view.setUIDelegate(Some(ProtocolObject::from_ref(&*observer)));
             view.setAllowsBackForwardNavigationGestures(true);
-            for key in OBSERVED.iter().chain(full_screen_key(&view)) {
+            for key in OBSERVED
+                .iter()
+                .chain(full_screen_key(&view))
+                .chain(theme_color_key(&view))
+            {
                 view.addObserver_forKeyPath_options_context(
                     &observer,
                     &NSString::from_str(key),
@@ -1369,6 +1459,99 @@ impl WebViewBackend for MacWebView {
             );
         }
     }
+    fn edit(&self, command: zgx::web_view::EditCommand) -> Result<(), String> {
+        use zgx::web_view::EditCommand;
+        // SAFETY: AppKit's standard actions, which WKWebView answers, and
+        // its undo manager's, on the main thread; a nil sender.
+        unsafe {
+            let sender = None::<&AnyObject>;
+            match command {
+                EditCommand::Copy => {
+                    let _: () = msg_send![&*self.view, copy: sender];
+                }
+                EditCommand::Cut => {
+                    let _: () = msg_send![&*self.view, cut: sender];
+                }
+                EditCommand::Paste => {
+                    let _: () = msg_send![&*self.view, paste: sender];
+                }
+                EditCommand::SelectAll => {
+                    let _: () = msg_send![&*self.view, selectAll: sender];
+                }
+                EditCommand::Undo | EditCommand::Redo => {
+                    let manager: Option<Retained<AnyObject>> = msg_send![&*self.view, undoManager];
+                    let Some(manager) = manager else {
+                        return Err("the page has no undo manager".into());
+                    };
+                    if command == EditCommand::Undo {
+                        let _: () = msg_send![&*manager, undo];
+                    } else {
+                        let _: () = msg_send![&*manager, redo];
+                    }
+                }
+                _ => return Err("WKWebView has no such editing command".into()),
+            }
+        }
+        Ok(())
+    }
+    fn reload_ignoring_cache(&self) -> Result<(), String> {
+        // A page of HTML the app gave is given again, as `Reload` does: its
+        // base URL is only its origin, with nothing at it to fetch.
+        let on_html = self.html.borrow().as_ref().is_some_and(|(_, base)| {
+            let shown = base
+                .as_ref()
+                .and_then(|base| base.absoluteString())
+                .map_or_else(|| "about:blank".into(), |url| url.to_string());
+            url_of(&self.view) == shown
+        });
+        if on_html {
+            self.run(WebViewCommand::Reload);
+            return Ok(());
+        }
+        // SAFETY: WKWebView's `reloadFromOrigin` on the main thread, as
+        // `run`'s reload.
+        let _ = unsafe { self.view.reloadFromOrigin() };
+        Ok(())
+    }
+    fn snapshot(
+        &self,
+        area: zgx::web_view::SnapshotArea,
+        reply: Box<dyn FnOnce(zgx::web_view::SnapshotResult)>,
+    ) {
+        // WKWebView snapshots what it shows; a whole page beyond it isn't drawn.
+        if area == zgx::web_view::SnapshotArea::FullPage {
+            reply(Err(
+                "WKWebView can't take a snapshot of the whole page".into()
+            ));
+            return;
+        }
+        let scale = self
+            .view
+            .window()
+            .map_or(2., |window| window.backingScaleFactor());
+        let reply = Cell::new(Some(reply));
+        let done = block2::RcBlock::new(
+            move |image: *mut objc2_app_kit::NSImage, error: *mut NSError| {
+                let Some(reply) = reply.take() else { return };
+                // SAFETY: the image or error WebKit passes, on the main thread.
+                let result = match unsafe { (image.as_ref(), error.as_ref()) } {
+                    (Some(image), _) => snapshot_pixels(image, scale),
+                    (None, Some(error)) => Err(error.localizedDescription().to_string()),
+                    (None, None) => Err("WebKit took no snapshot".into()),
+                };
+                zgx::native_view::post(move || reply(result));
+            },
+        );
+        // SAFETY: `takeSnapshotWithConfiguration:completionHandler:` (macOS
+        // 10.13) on the main thread; a nil configuration takes what shows.
+        unsafe {
+            let _: () = msg_send![
+                &*self.view,
+                takeSnapshotWithConfiguration: None::<&AnyObject>,
+                completionHandler: &*done
+            ];
+        }
+    }
     fn clear_site_data(&self, url: &str, done: Box<dyn FnOnce(Result<usize, String>)>) {
         let Some(host) = zgx::web_view::site_host(url) else {
             return done(Err(format!("{url} has no site")));
@@ -1442,7 +1625,11 @@ impl Drop for MacWebView {
                         .map(|view| -> &objc2_app_kit::NSResponder { view }),
                 );
             }
-            for key in OBSERVED.iter().chain(full_screen_key(&self.view)) {
+            for key in OBSERVED
+                .iter()
+                .chain(full_screen_key(&self.view))
+                .chain(theme_color_key(&self.view))
+            {
                 self.view
                     .removeObserver_forKeyPath(&self.observer, &NSString::from_str(key));
             }

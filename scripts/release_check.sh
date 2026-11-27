@@ -55,7 +55,7 @@ cd "$(git rev-parse --show-toplevel)"
 # `--allow-dirty`: check uncommitted changes too (a release itself is clean).
 dirty=""
 if [ "${1:-}" = --allow-dirty ]; then dirty=--allow-dirty; fi
-forks="harfrust swash cosmic-text taffy mlua vte alacritty-terminal zune-jpeg arboard"
+forks="harfrust swash cosmic-text taffy mlua-sys mlua vte alacritty-terminal zune-jpeg arboard"
 # Where packages are unpacked, the forks' beside the workspace's (3 reads
 # them there).
 target="${CARGO_TARGET_DIR:-target}"
@@ -67,13 +67,14 @@ for fork in $forks; do
     echo "== zgx-$fork (vendor/$fork)"
     # mlua builds for one Lua, chosen by a feature: zgx's, Luau.
     features=""
-    if [ "$fork" = mlua ]; then features="--features luau"; fi
+    if [ "$fork" = mlua ] || [ "$fork" = mlua-sys ]; then features="--features luau"; fi
     # A fork is given only the forks it depends on: a patch it never uses
     # is written into its own lockfile (`[[patch.unused]]`, harfrust's and
     # taffy's are committed), which leaves the checkout dirty.
     deps=""
     if [ "$fork" = cosmic-text ]; then deps="harfrust swash"; fi
     if [ "$fork" = alacritty-terminal ]; then deps="vte"; fi
+    if [ "$fork" = mlua ]; then deps="mlua-sys"; fi
     given=""
     for dep in $deps; do
         given="$given --config patch.crates-io.zgx-$dep.path=\"vendor/$dep\""
@@ -168,6 +169,8 @@ ONLY = {
     "zgx-desktop/webkitgtk": {"linux"},
     # Turned on through zgx-desktop/ghostty, which gives it what it links to.
     "zgx-ghostty-sys/link": set(),
+    # Ladybird's client is Unix's (zgx-ladybird-sys, unpublished, builds the host).
+    "zgx-desktop/ladybird": {"linux", "macos"},
 }
 metadata = json.loads(subprocess.check_output(
     ["cargo", "metadata", "--format-version", "1", "--no-deps", "--locked"]))
@@ -293,8 +296,21 @@ fi
 semver="$target/semver"
 rm -rf "$semver"
 mkdir -p "$semver"
+# semver-checks reads a library's API, and a proc-macro crate has none it
+# can read (it refuses zgx-module-macros): its macros are checked by the
+# previous release's crates that use them building against it (above).
+proc_macros=" $(cargo metadata --no-deps --format-version 1 < /dev/null | "$python" -c '
+import json, sys
+print(" ".join(p["name"] for p in json.load(sys.stdin)["packages"]
+               if any("proc-macro" in t["kind"] for t in p["targets"])))') "
 while read -r crate previous current had; do
     if [ "$previous" = - ]; then continue; fi
+    case "$proc_macros" in
+    *" $crate "*)
+        echo "$crate against $previous: a proc-macro, built against above, not semver-checked"
+        continue
+        ;;
+    esac
     # Default features and this platform's others, as the features app
     # built them, not semver-checks' guess at them (it took
     # zgx-ghostty-sys/link, macOS's alone, everywhere).

@@ -336,6 +336,30 @@ pub struct WebViewOptions {
     /// of 40–52%. Pages then draw no `backdrop-filter`, and flatten 3D transforms
     /// (no perspective). See docs/native-surfaces.md.
     pub accelerated: bool,
+    /// The engine that draws the page: the platform's (the default), or
+    /// Ladybird where the desktop host was built with it (zgx-desktop's
+    /// `ladybird` feature). Where the engine asked for is missing, the
+    /// page shows its placeholder.
+    #[doc(hidden)]
+    pub engine: WebEngine,
+    /// Load each page's icon and keep it in [`WebViewState::favicon`], as a
+    /// browser's tab shows it. Off by default: WebKitGTK then fetches a
+    /// site's icon only for apps that show it.
+    #[doc(hidden)]
+    pub favicons: bool,
+}
+/// The engine a web view's page runs in (see [`WebViewOptions::engine`]).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum WebEngine {
+    /// The platform's own: WKWebView on macOS, WebView2 on Windows,
+    /// WebKitGTK on Linux.
+    #[default]
+    Platform,
+    /// Ladybird, run in a process of zgx's (`zgx-ladybird-host`) and drawn
+    /// as an image in the window's own paint.
+    Ladybird,
 }
 impl Default for WebViewOptions {
     fn default() -> Self {
@@ -349,6 +373,8 @@ impl Default for WebViewOptions {
             scripts: Vec::new(),
             schemes: Vec::new(),
             accelerated: true,
+            engine: WebEngine::Platform,
+            favicons: false,
         }
     }
 }
@@ -392,6 +418,65 @@ pub struct WebViewState {
     /// over the screen; on Windows and Linux it fills the page's box, which
     /// an app grows (or makes its window full screen) to show it so.
     pub full_screen: bool,
+    /// The link under the pointer, as a browser's status bar shows it, while
+    /// the pointer is over one. `None` where the engine doesn't say
+    /// (WKWebView has no public way to).
+    #[doc(hidden)]
+    pub hovered_link: Option<String>,
+    /// The page's theme colour (`<meta name="theme-color">`), which a
+    /// browser tints its tab or toolbar with. `None` without one, or where
+    /// the engine doesn't say (WebView2, and WebKitGTK for a page painted on
+    /// the CPU, `accelerated: false`).
+    #[doc(hidden)]
+    pub theme_color: Option<crate::scene::Color>,
+    /// The page's process stopped answering (a script in a loop), until it
+    /// answers again (`WebViewEvent::Unresponsive` and `Responsive`). Not
+    /// on macOS or with Ladybird, whose engines don't say.
+    #[doc(hidden)]
+    pub unresponsive: bool,
+    /// Why the page's process last ended, where the engine says (with
+    /// `WebViewEvent::ProcessTerminated`).
+    #[doc(hidden)]
+    pub termination: Option<Termination>,
+    /// The page's icon, as its engine loaded it, with
+    /// [`WebViewOptions::favicons`] on (`WebViewEvent::FaviconChanged`).
+    /// `None` without one, and on macOS: WKWebView doesn't give it.
+    #[doc(hidden)]
+    pub favicon: Option<std::sync::Arc<crate::image::ImageData>>,
+}
+/// Why a page's process ended (see [`WebViewState::termination`]).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Termination {
+    /// It crashed.
+    Crashed,
+    /// It used more memory than it may.
+    OutOfMemory,
+    /// It was ended: by the system, the user, or the engine itself (a page
+    /// that stopped answering, a protocol error).
+    Killed,
+    /// The engine doesn't say.
+    Unknown,
+}
+/// An editing command for the page (see [`WebView::edit`]): what a
+/// browser's Edit menu does, to the page's selection or focused field.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum EditCommand {
+    /// Copy the selection to the clipboard.
+    Copy,
+    /// Copy the selection and delete it from its field.
+    Cut,
+    /// Paste the clipboard into the focused field.
+    Paste,
+    /// Select all of the focused field, or of the page.
+    SelectAll,
+    /// Undo the last edit in the page.
+    Undo,
+    /// Redo it.
+    Redo,
 }
 
 /// What happened in a page, as the platform reports it (see
@@ -451,6 +536,27 @@ pub enum WebViewEvent {
     },
     /// The page's process ended (crashed or was killed); reload to recover.
     ProcessTerminated,
+    /// A page was visited: a navigation finished, with the title the page
+    /// had then, on every engine alike (sent by the controller after each
+    /// `NavigationFinished`). What a browser's history records; a title the
+    /// page sets later comes as `TitleChanged`.
+    /// The page's icon changed (see [`WebViewState::favicon`]).
+    #[doc(hidden)]
+    FaviconChanged,
+    /// The page's process stopped answering (see
+    /// [`WebViewState::unresponsive`]).
+    #[doc(hidden)]
+    Unresponsive,
+    /// It answers again.
+    #[doc(hidden)]
+    Responsive,
+    #[doc(hidden)]
+    Visited {
+        /// The page's URL.
+        url: String,
+        /// Its title when it finished loading.
+        title: String,
+    },
 }
 
 /// A JavaScript evaluation's result: the value as JSON, or the error.
@@ -546,6 +652,20 @@ pub struct FindResult {
     pub matches: Option<u32>,
 }
 
+/// What [`WebView::snapshot`] takes.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SnapshotArea {
+    /// What the view shows now.
+    #[default]
+    Visible,
+    /// The whole document, as tall and wide as it scrolls.
+    FullPage,
+}
+/// A snapshot's answer: the page's pixels, or why there are none.
+#[doc(hidden)]
+pub type SnapshotResult = Result<std::sync::Arc<crate::image::ImageData>, String>;
+
 /// A platform's page (implemented by the desktop host).
 pub trait WebViewBackend {
     /// Carry out `command`.
@@ -571,6 +691,30 @@ pub trait WebViewBackend {
         done(Err(
             "this platform's web view can't clear a site's data".into()
         ));
+    }
+    /// Carry out an editing command (see `WebView::edit`). One that can't
+    /// says so.
+    #[doc(hidden)]
+    fn edit(&self, command: EditCommand) -> Result<(), String> {
+        let _ = command;
+        Err("this platform's web view takes no editing commands".into())
+    }
+    /// Reload, fetching everything again (see
+    /// `WebView::reload_ignoring_cache`). One that can't says so.
+    #[doc(hidden)]
+    fn reload_ignoring_cache(&self) -> Result<(), String> {
+        Err("this platform's web view can't reload ignoring its cache".into())
+    }
+    /// The page's pixels (see `WebView::snapshot`), calling `reply` once,
+    /// on the UI thread. One that can't says so.
+    #[doc(hidden)]
+    fn snapshot(&self, area: SnapshotArea, reply: Box<dyn FnOnce(SnapshotResult)>) {
+        reply(Err(match area {
+            SnapshotArea::Visible => "this platform's web view can't take a snapshot".into(),
+            SnapshotArea::FullPage => {
+                "this platform's web view can't take a snapshot of the whole page".into()
+            }
+        }));
     }
 }
 
@@ -805,6 +949,18 @@ impl WebView {
     pub fn can_go_forward(&self) -> bool {
         self.0.state.with(|state| state.can_go_forward)
     }
+    /// The link under the pointer (see [`WebViewState::hovered_link`])
+    /// (reactive).
+    #[doc(hidden)]
+    pub fn hovered_link(&self) -> Option<String> {
+        self.0.state.with(|state| state.hovered_link.clone())
+    }
+    /// The page's theme colour (see [`WebViewState::theme_color`])
+    /// (reactive).
+    #[doc(hidden)]
+    pub fn theme_color(&self) -> Option<crate::scene::Color> {
+        self.0.state.with(|state| state.theme_color)
+    }
     /// Whether the page has keyboard focus (reactive).
     pub fn focused(&self) -> bool {
         self.0.state.with(|state| state.focused)
@@ -985,6 +1141,36 @@ impl WebView {
             (Some(backend), Some(_)) => backend.clear_site_data(url, Box::new(done)),
         }
     }
+    /// Carry out `command` in the page, as a browser's Edit menu does
+    /// (copy and cut go to the system's clipboard, paste comes from it).
+    /// `Err` where the page isn't showing or the engine can't.
+    #[doc(hidden)]
+    pub fn edit(&self, command: EditCommand) -> Result<(), String> {
+        match self.backend() {
+            Some(backend) => backend.edit(command),
+            None => Err("the page isn't showing yet".into()),
+        }
+    }
+    /// Reload the page, fetching it and what it loads again rather than from
+    /// the cache (a browser's Shift+reload). `Err` where the page isn't
+    /// showing or the engine can't.
+    #[doc(hidden)]
+    pub fn reload_ignoring_cache(&self) -> Result<(), String> {
+        match self.backend() {
+            Some(backend) => backend.reload_ignoring_cache(),
+            None => Err("the page isn't showing yet".into()),
+        }
+    }
+    /// The page's pixels, `area` of it, straight from its engine (not the
+    /// window's frame: what covers the page isn't in it), to `reply` once.
+    /// A page not yet showing, or an engine that can't, answers why not.
+    #[doc(hidden)]
+    pub fn snapshot(&self, area: SnapshotArea, reply: impl FnOnce(SnapshotResult) + 'static) {
+        match self.backend() {
+            Some(backend) => backend.snapshot(area, Box::new(reply)),
+            None => reply(Err("the page isn't showing yet".into())),
+        }
+    }
     /// Stop finding: the match goes unselected and the platform's
     /// highlights of the others go.
     pub fn clear_find(&self) {
@@ -1084,10 +1270,15 @@ impl WebView {
             .iter()
             .map(|(_, listener)| listener.clone())
             .collect();
-        for listener in listeners {
+        for listener in &listeners {
             if let Ok(mut listener) = listener.try_borrow_mut() {
                 listener(&event);
             }
+        }
+        // Each finished navigation is a visit, whichever engine reported it.
+        if let WebViewEvent::NavigationFinished { url } = event {
+            let title = self.0.state.with_untracked(|state| state.title.clone());
+            self.emit(WebViewEvent::Visited { url, title });
         }
     }
 }
@@ -1162,6 +1353,22 @@ impl PageViews {
     pub fn new(make: impl Fn(&WebView) -> Option<View> + 'static) -> Self {
         Self(Rc::new(make))
     }
+    /// The box for `web`'s page, or `None` for a native view: so a host's
+    /// service can hand the pages it doesn't draw to another.
+    #[doc(hidden)]
+    pub fn make(&self, web: &WebView) -> Option<View> {
+        (self.0)(web)
+    }
+}
+/// What a page shows where its engine is missing, filling its box: a host's
+/// [`PageViews`] gives it for an engine it was asked for and doesn't have.
+#[doc(hidden)]
+pub fn placeholder_view(web: &WebView) -> View {
+    div()
+        .relative()
+        .w_full()
+        .h_full()
+        .child(placeholder(NativeContent::Web(web.clone())))
 }
 fn native(
     content: NativeContent,
@@ -1303,6 +1510,100 @@ mod tests {
         for malformed in ["", "MyApp", "2app", "my app", "my:app", "app/x"] {
             assert!(!is_app_scheme(malformed), "{malformed:?}");
         }
+    }
+
+    #[test]
+    fn a_finished_navigation_is_a_visit_with_the_title_then() {
+        let runtime = crate::reactive::Runtime::new();
+        let web = WebView::new(&runtime, WebViewOptions::default());
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        let log = heard.clone();
+        let _subscription = web.on_event(move |event| log.borrow_mut().push(event.clone()));
+        web.update_state(|state| state.title = "Home".into());
+        web.emit(WebViewEvent::NavigationFinished {
+            url: "https://a.test/".into(),
+        });
+        web.emit(WebViewEvent::NavigationFailed {
+            url: "https://b.test/".into(),
+            error: "no".into(),
+        });
+        assert_eq!(
+            *heard.borrow(),
+            [
+                WebViewEvent::NavigationFinished {
+                    url: "https://a.test/".into()
+                },
+                WebViewEvent::Visited {
+                    url: "https://a.test/".into(),
+                    title: "Home".into()
+                },
+                WebViewEvent::NavigationFailed {
+                    url: "https://b.test/".into(),
+                    error: "no".into()
+                },
+            ],
+            "a failure visits nothing"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_says_why_there_is_none() {
+        struct Plain;
+        impl WebViewBackend for Plain {
+            fn run(&self, _: WebViewCommand) {}
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+        let runtime = crate::reactive::Runtime::new();
+        let web = WebView::new(&runtime, WebViewOptions::default());
+        let got = Rc::new(RefCell::new(Vec::new()));
+        let take = |got: &Rc<RefCell<Vec<String>>>| {
+            let got = got.clone();
+            move |result: SnapshotResult| got.borrow_mut().push(result.err().unwrap_or_default())
+        };
+        web.snapshot(SnapshotArea::Visible, take(&got));
+        web.attach(Rc::new(Plain));
+        web.snapshot(SnapshotArea::Visible, take(&got));
+        web.snapshot(SnapshotArea::FullPage, take(&got));
+        assert_eq!(
+            *got.borrow(),
+            [
+                "the page isn't showing yet",
+                "this platform's web view can't take a snapshot",
+                "this platform's web view can't take a snapshot of the whole page",
+            ]
+        );
+    }
+
+    #[test]
+    fn commands_an_engine_lacks_say_so() {
+        struct Plain;
+        impl WebViewBackend for Plain {
+            fn run(&self, _: WebViewCommand) {}
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+        let runtime = crate::reactive::Runtime::new();
+        let web = WebView::new(&runtime, WebViewOptions::default());
+        assert_eq!(
+            web.edit(EditCommand::Copy),
+            Err("the page isn't showing yet".into())
+        );
+        assert_eq!(
+            web.reload_ignoring_cache(),
+            Err("the page isn't showing yet".into())
+        );
+        web.attach(Rc::new(Plain));
+        assert_eq!(
+            web.edit(EditCommand::Paste),
+            Err("this platform's web view takes no editing commands".into())
+        );
+        assert_eq!(
+            web.reload_ignoring_cache(),
+            Err("this platform's web view can't reload ignoring its cache".into())
+        );
     }
 
     #[test]

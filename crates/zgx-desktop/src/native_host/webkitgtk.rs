@@ -427,6 +427,8 @@ struct Page {
     surface_size: Cell<(i32, i32)>,
     damage: Cell<Damage>,
     draw_queued: Cell<bool>,
+    /// The link last reported under the pointer (`on_mouse_target`).
+    hovered: RefCell<Option<String>>,
     html: RefCell<Option<(String, Option<String>)>>,
     /// The app's zoom of the page, and device pixels a point.
     zoom: Cell<(f64, f64)>,
@@ -490,6 +492,7 @@ struct Spec {
     messages: bool,
     new_windows: bool,
     accelerated: bool,
+    favicons: bool,
     scripts: Vec<(String, bool)>,
     schemes: Vec<String>,
     frame: Arc<Mutex<Frame>>,
@@ -683,6 +686,7 @@ impl Gtk {
                 surface: Cell::new(null_mut()),
                 surface_size: Cell::new((0, 0)),
                 damage: Cell::new(Damage::default()),
+                hovered: RefCell::new(None),
                 draw_queued: Cell::new(false),
                 html: RefCell::new(None),
                 zoom: Cell::new((1., 1.)),
@@ -735,6 +739,51 @@ impl Gtk {
                 data,
                 false,
             );
+            // The page's icon, where the app shows it: WebKit loads icons
+            // only with its favicon database on, a context's own.
+            if spec.favicons {
+                if let Some(enable) = api.webkit_website_data_manager_set_favicons_enabled {
+                    enable((api.webkit_web_view_get_website_data_manager)(view), 1);
+                } else if let Some(directory) =
+                    api.webkit_web_context_set_favicon_database_directory
+                {
+                    directory(context, std::ptr::null());
+                }
+                connect(
+                    api,
+                    view,
+                    "notify::favicon",
+                    handler(on_favicon as *const ()),
+                    data,
+                    false,
+                );
+            }
+            connect(
+                api,
+                view,
+                "notify::is-web-process-responsive",
+                handler(on_responsive as *const ()),
+                data,
+                false,
+            );
+            connect(
+                api,
+                view,
+                "mouse-target-changed",
+                handler(on_mouse_target as *const ()),
+                data,
+                false,
+            );
+            if api.webkit_web_view_get_theme_color.is_some() {
+                connect(
+                    api,
+                    view,
+                    "notify::theme-color",
+                    handler(on_theme_color as *const ()),
+                    data,
+                    false,
+                );
+            }
             for property in ["title", "uri", "estimated-load-progress", "is-loading"] {
                 connect(
                     api,
@@ -1756,6 +1805,36 @@ impl Page {
                         *self.finding.borrow_mut() = Some(search);
                     }
                 }
+                Command::Edit(command) => {
+                    (api.webkit_web_view_execute_editing_command)(view, command.as_ptr());
+                    check_clipboard();
+                }
+                // A page of HTML the app gave is given again, as `Reload` does: its
+                // base URL is only its origin, with nothing at it to fetch.
+                Command::ReloadIgnoringCache => {
+                    let html = self.html.borrow().clone().filter(|(_, base)| {
+                        self.uri() == base.clone().unwrap_or_else(|| "about:blank".into())
+                    });
+                    match html {
+                        Some((html, base)) => self.run(Command::LoadHtml {
+                            html,
+                            base_url: base,
+                        }),
+                        None => (api.webkit_web_view_reload_bypass_cache)(view),
+                    }
+                }
+                Command::Snapshot { full, reply } => {
+                    // WEBKIT_SNAPSHOT_REGION_VISIBLE 0, _FULL_DOCUMENT 1; no options.
+                    let asked = Box::new((self.id, reply));
+                    (api.webkit_web_view_get_snapshot)(
+                        view,
+                        c_int::from(full),
+                        0,
+                        null_mut(),
+                        snapshot_taken,
+                        Box::into_raw(asked) as Ptr,
+                    );
+                }
                 Command::ClearFind => {
                     (api.webkit_find_controller_search_finish)((api
                         .webkit_web_view_get_find_controller)(
@@ -2618,6 +2697,47 @@ unsafe extern "C" fn on_notify(_: Ptr, _: Ptr, data: Ptr) {
     // SAFETY: GTK passes this handler's page.
     unsafe { page(data) }.report(false);
 }
+/// The pointer moved over something else: a link's address is the page's
+/// hovered link, anything else none.
+unsafe extern "C" fn on_mouse_target(_: Ptr, hit: Ptr, _modifiers: c_uint, data: Ptr) {
+    let api = gtk::api().expect("GTK runs");
+    // SAFETY: GTK passes the hit test result (valid for the call) and this
+    // handler's page; the link's address is copied now.
+    let (page, link) = unsafe {
+        let link = (api.webkit_hit_test_result_get_link_uri)(hit);
+        (page(data), (!link.is_null()).then(|| string(link)))
+    };
+    let link = link.filter(|link| !link.is_empty());
+    if page.hovered.replace(link.clone()) != link {
+        page.post(move |web| web.update_state(|state| state.hovered_link = link));
+    }
+}
+/// The page's theme colour changed (WebKitGTK 2.38's `theme-color`).
+unsafe extern "C" fn on_theme_color(view: Ptr, _: Ptr, data: Ptr) {
+    let api = gtk::api().expect("GTK runs");
+    let Some(get) = api.webkit_web_view_get_theme_color else {
+        return;
+    };
+    let mut rgba = gtk::GdkRGBA {
+        red: 0.,
+        green: 0.,
+        blue: 0.,
+        alpha: 0.,
+    };
+    // SAFETY: the view GTK passes, and an RGBA for it to fill; it says
+    // whether the page has a theme colour.
+    let (page, has) = unsafe { (page(data), get(view, &mut rgba) != 0) };
+    let channel = |value: f64| (value.clamp(0., 1.) * 255.).round() as u8;
+    let color = has.then(|| {
+        zgx::scene::Color(
+            channel(rgba.red),
+            channel(rgba.green),
+            channel(rgba.blue),
+            channel(rgba.alpha),
+        )
+    });
+    page.post(move |web| web.update_state(|state| state.theme_color = color));
+}
 unsafe extern "C" fn on_history(_: Ptr, _: Ptr, _: Ptr, data: Ptr) {
     // SAFETY: GTK passes this handler's page.
     unsafe { page(data) }.report(true);
@@ -2688,14 +2808,87 @@ unsafe extern "C" fn on_decide_policy(
     });
     1
 }
-unsafe extern "C" fn on_terminated(_: Ptr, _: c_int, data: Ptr) {
+unsafe extern "C" fn on_terminated(_: Ptr, reason: c_int, data: Ptr) {
+    // WEBKIT_WEB_PROCESS_CRASHED, _EXCEEDED_MEMORY_LIMIT, _TERMINATED_BY_API.
+    let termination = match reason {
+        0 => zgx::web_view::Termination::Crashed,
+        1 => zgx::web_view::Termination::OutOfMemory,
+        2 => zgx::web_view::Termination::Killed,
+        _ => zgx::web_view::Termination::Unknown,
+    };
     // SAFETY: GTK passes this handler's page.
-    unsafe { page(data) }.post(|web| {
+    unsafe { page(data) }.post(move |web| {
         web.update_state(|state| {
             state.loading = false;
             state.error = Some("The page stopped responding.".into());
+            state.termination = Some(termination);
+            state.unresponsive = false;
         });
         web.emit(WebViewEvent::ProcessTerminated);
+    });
+}
+/// The page's icon changed: its cairo surface (ARGB32, premultiplied, BGRA
+/// here), copied as RGBA, or none.
+unsafe extern "C" fn on_favicon(view: Ptr, _: Ptr, data: Ptr) {
+    let api = gtk::api().expect("GTK runs");
+    // SAFETY: the view GTK passes and this handler's page; the surface is
+    // WebKit's, read now (not kept).
+    let (page, favicon) = unsafe {
+        let surface = (api.webkit_web_view_get_favicon)(view);
+        let favicon = (!surface.is_null() && (api.cairo_image_surface_get_format)(surface) == 0)
+            .then(|| {
+                (api.cairo_surface_flush)(surface);
+                let width = (api.cairo_image_surface_get_width)(surface).max(0) as usize;
+                let height = (api.cairo_image_surface_get_height)(surface).max(0) as usize;
+                let stride = (api.cairo_image_surface_get_stride)(surface).max(0) as usize;
+                let pixels = (api.cairo_image_surface_get_data)(surface);
+                if pixels.is_null() || width == 0 || height == 0 {
+                    return None;
+                }
+                let bytes = std::slice::from_raw_parts(pixels, stride * height);
+                let mut rgba = Vec::with_capacity(width * height * 4);
+                for row in bytes.chunks_exact(stride) {
+                    for pixel in row[..width * 4].as_chunks::<4>().0 {
+                        rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+                    }
+                }
+                Some((width as u32, height as u32, rgba))
+            })
+            .flatten();
+        (page(data), favicon)
+    };
+    page.post(move |web| {
+        let favicon = favicon.and_then(|(width, height, rgba)| {
+            zgx::image::ImageData::new_premultiplied(width, height, rgba)
+                .ok()
+                .map(Arc::new)
+        });
+        web.update_state(|state| state.favicon = favicon);
+        web.emit(WebViewEvent::FaviconChanged);
+    });
+}
+/// The web process stopped answering, or answers again
+/// (`is-web-process-responsive`).
+unsafe extern "C" fn on_responsive(view: Ptr, _: Ptr, data: Ptr) {
+    let api = gtk::api().expect("GTK runs");
+    // SAFETY: the view GTK passes and this handler's page.
+    let (page, responsive) = unsafe {
+        (
+            page(data),
+            (api.webkit_web_view_get_is_web_process_responsive)(view) != 0,
+        )
+    };
+    page.post(move |web| {
+        let was = web.state().with_untracked(|state| state.unresponsive);
+        if was == !responsive {
+            return;
+        }
+        web.update_state(|state| state.unresponsive = !responsive);
+        web.emit(if responsive {
+            WebViewEvent::Responsive
+        } else {
+            WebViewEvent::Unresponsive
+        });
     });
 }
 /// Each download a context starts (a `download` link, an attachment) goes
@@ -3466,6 +3659,57 @@ unsafe fn take_error(api: &Api, error: *mut gtk::GError) -> Option<String> {
         }
     })
 }
+/// WebKit took a snapshot (`Command::Snapshot`): its pixels, read from the
+/// cairo image surface it made, go to the UI thread's reply.
+unsafe extern "C" fn snapshot_taken(view: Ptr, result: Ptr, data: Ptr) {
+    let api = gtk::api().expect("GTK runs");
+    // SAFETY: the box `Command::Snapshot` leaked for this call, taken back once.
+    let (page_id, reply) = *unsafe { Box::from_raw(data as *mut (u64, u64)) };
+    let mut error: *mut gtk::GError = null_mut();
+    // SAFETY: the view and result WebKit passes; the surface is ours to
+    // destroy, read while it lives: ARGB32 (premultiplied, native-endian:
+    // BGRA here) rows `stride` apart.
+    let image = unsafe {
+        let surface = (api.webkit_web_view_get_snapshot_finish)(view, result, &mut error);
+        if surface.is_null() {
+            if !error.is_null() {
+                (api.g_error_free)(error);
+            }
+            Err("WebKitGTK took no snapshot of the page".to_owned())
+        } else {
+            (api.cairo_surface_flush)(surface);
+            let width = (api.cairo_image_surface_get_width)(surface).max(0) as usize;
+            let height = (api.cairo_image_surface_get_height)(surface).max(0) as usize;
+            let stride = (api.cairo_image_surface_get_stride)(surface).max(0) as usize;
+            let data = (api.cairo_image_surface_get_data)(surface);
+            let read = if data.is_null() || (api.cairo_image_surface_get_format)(surface) != 0 {
+                Err("WebKitGTK's snapshot isn't an ARGB image".to_owned())
+            } else {
+                let bytes = std::slice::from_raw_parts(data, stride * height);
+                let mut rgba = Vec::with_capacity(width * height * 4);
+                for row in bytes.chunks_exact(stride) {
+                    for pixel in row[..width * 4].as_chunks::<4>().0 {
+                        rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+                    }
+                }
+                Ok((width as u32, height as u32, rgba))
+            };
+            (api.cairo_surface_destroy)(surface);
+            read
+        }
+    };
+    deliver(move || {
+        if let Some(page) = ui_page(page_id)
+            && let Some(reply) = page.snapshots.borrow_mut().remove(&reply)
+        {
+            reply(image.and_then(|(width, height, rgba)| {
+                zgx::image::ImageData::new_premultiplied(width, height, rgba)
+                    .map(Arc::new)
+                    .map_err(|_| "the snapshot had no pixels".to_owned())
+            }));
+        }
+    });
+}
 unsafe extern "C" fn site_data_fetched(manager: Ptr, result: Ptr, data: Ptr) {
     let api = gtk::api().expect("GTK runs");
     // SAFETY: the box `Command::ClearSiteData` made, taken once; the result
@@ -3932,6 +4176,15 @@ enum Command {
         reply: u64,
     },
     ClearFind,
+    /// An editing command WebKit names (`WEBKIT_EDITING_COMMAND_*`).
+    Edit(&'static std::ffi::CStr),
+    /// Reload, fetching everything again.
+    ReloadIgnoringCache,
+    /// The page's pixels, the whole document's if `full` (`snapshot`).
+    Snapshot {
+        full: bool,
+        reply: u64,
+    },
     /// The box's size in device pixels, and device pixels a point.
     Size {
         width: u32,
@@ -4042,6 +4295,7 @@ fn ui_page(id: u64) -> Option<Rc<UiPage>> {
 type Reply = Box<dyn FnOnce(ScriptResult)>;
 /// What gets a find's answer.
 type FindReply = Box<dyn FnOnce(FindResult)>;
+type SnapshotReply = Box<dyn FnOnce(zgx::web_view::SnapshotResult)>;
 type SiteClearReply = Box<dyn FnOnce(Result<usize, String>)>;
 /// A page, on the UI thread: what its controller, box and painter share.
 /// The longest a page's commands wait for zgx's accessibility as focus
@@ -4124,6 +4378,8 @@ struct UiPage {
     finds: RefCell<HashMap<u64, FindReply>>,
     /// What gets each `clear_site_data`'s answer, under the same ids.
     site_clears: RefCell<HashMap<u64, SiteClearReply>>,
+    /// What gets each snapshot's answer, under the same ids.
+    snapshots: RefCell<HashMap<u64, SnapshotReply>>,
     next_reply: Cell<u64>,
     /// The box showing it, and its scene.
     node: Cell<Option<NodeId>>,
@@ -4606,6 +4862,50 @@ impl WebViewBackend for GtkWebView {
             reply: id,
         });
     }
+    fn edit(&self, command: zgx::web_view::EditCommand) -> Result<(), String> {
+        use zgx::web_view::EditCommand;
+        let page = &self.0;
+        let name = match command {
+            EditCommand::Copy => c"Copy",
+            EditCommand::Cut => c"Cut",
+            EditCommand::Paste => c"Paste",
+            EditCommand::SelectAll => c"SelectAll",
+            EditCommand::Undo => c"Undo",
+            EditCommand::Redo => c"Redo",
+            _ => return Err("WebKitGTK has no such editing command".into()),
+        };
+        // A paste where GTK's clipboard reaches nothing: zgx's text first.
+        if command == EditCommand::Paste && BRIDGED.load(std::sync::atomic::Ordering::Relaxed) {
+            let text = page
+                .clipboard
+                .borrow_mut()
+                .as_mut()
+                .and_then(|clipboard| clipboard.get_text().ok());
+            if let Some(text) = text {
+                page.send(Command::Clipboard(text));
+            }
+        }
+        page.send(Command::Edit(name));
+        Ok(())
+    }
+    fn reload_ignoring_cache(&self) -> Result<(), String> {
+        self.0.send(Command::ReloadIgnoringCache);
+        Ok(())
+    }
+    fn snapshot(
+        &self,
+        area: zgx::web_view::SnapshotArea,
+        reply: Box<dyn FnOnce(zgx::web_view::SnapshotResult)>,
+    ) {
+        let page = &self.0;
+        let id = page.next_reply.get() + 1;
+        page.next_reply.set(id);
+        page.snapshots.borrow_mut().insert(id, reply);
+        page.send(Command::Snapshot {
+            full: area == zgx::web_view::SnapshotArea::FullPage,
+            reply: id,
+        });
+    }
     fn clear_find(&self) {
         self.0.send(Command::ClearFind);
     }
@@ -4673,6 +4973,7 @@ fn backend(
         replies: RefCell::new(HashMap::new()),
         finds: RefCell::new(HashMap::new()),
         site_clears: RefCell::new(HashMap::new()),
+        snapshots: RefCell::new(HashMap::new()),
         next_reply: Cell::new(0),
         node: Cell::new(None),
         scene: RefCell::new(Weak::new()),
@@ -4706,6 +5007,7 @@ fn backend(
         messages: options.messages,
         new_windows: options.new_windows,
         accelerated: options.accelerated,
+        favicons: options.favicons,
         scripts: options
             .scripts
             .iter()

@@ -18,8 +18,6 @@ mod audio;
 mod components;
 #[path = "../container_queries.rs"]
 mod container_queries;
-#[path = "../decision.rs"]
-mod decision;
 #[path = "../decode_image.rs"]
 mod decode_image;
 #[path = "../dim.rs"]
@@ -36,10 +34,16 @@ mod each_reorder;
 mod editor_fence_above;
 #[path = "../editor_group_leaves.rs"]
 mod editor_group_leaves;
+#[path = "../editor_grows_by_metrics.rs"]
+mod editor_grows_by_metrics;
 #[path = "../editor_metrics.rs"]
 mod editor_metrics;
+#[path = "../editor_metrics_when.rs"]
+mod editor_metrics_when;
 #[path = "../editor_props.rs"]
 mod editor_props;
+#[path = "../editor_text_metrics.rs"]
+mod editor_text_metrics;
 #[path = "../exiting_rows.rs"]
 mod exiting_rows;
 #[path = "../failures.rs"]
@@ -142,8 +146,6 @@ mod script_crashes;
 mod scroll_into_view_script;
 #[path = "../scrollbar_style.rs"]
 mod scrollbar_style;
-#[path = "../sealed.rs"]
-mod sealed;
 #[path = "../selection.rs"]
 mod selection;
 #[path = "../size_calc.rs"]
@@ -166,6 +168,8 @@ mod text_fade;
 mod text_props;
 #[path = "../theme.rs"]
 mod theme;
+#[path = "../transcript_over_composer.rs"]
+mod transcript_over_composer;
 #[path = "../ui.rs"]
 mod ui;
 #[path = "../ui_controls.rs"]

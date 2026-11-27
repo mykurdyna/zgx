@@ -51,11 +51,7 @@ script.reload()?;
 std::mem::forget(zgx_dom::mount_in_body(&runtime, script.view()));
 ```
 
-`zgx_dom::install_fetcher(&script)` gives the host the page's `fetch` for `ui.fetch`. Relative URLs resolve against the page's `document.baseURI` as it is when it's installed, and `install_fetcher_at(&script, base)` takes the URL the app is served under instead. Either way, a later navigation doesn't move them. The desktop's rules apply in the same places:
-
-- a plugin reaches it only with `Capability::Fetch`;
-- the app's `FetchPolicy` is asked of the URL and of each header the script set. With a policy, redirects are refused rather than followed, since a page can't show each hop to ask. `FetchPolicy::address` isn't asked, as the browser resolves names itself; the page's origin rules (CORS, `connect-src`) stand in for it;
-- a network failure, a refused CORS request or an abort rejects the script's promise as a `"network"` error, and an HTTP status is a response.
+`zgx_dom::install_fetcher(&script)` gives the host the page's `fetch` for `ui.fetch`. Relative URLs resolve against the page's `document.baseURI` as it is when it's installed, and `install_fetcher_at(&script, base)` takes the URL the app is served under instead. Either way, a later navigation doesn't move them. Redirects are followed, and the page's origin rules (CORS, `connect-src`) apply. A network failure, a refused CORS request or an abort rejects the script's promise as a `"network"` error, and an HTTP status is a response.
 
 The browser drops the request headers it forbids pages to set (`Host`, `Content-Length`, `Cookie` and the rest of its list) without saying so, where the desktop sends them. Credentials go to the page's own origin alone (`credentials: "same-origin"`). A fetch the script cancels, or a reload stops, is aborted. A page with a strict Content-Security-Policy needs `connect-src` for the hosts its app fetches from. The fetcher's JavaScript (`js/zgx-fetch.js`) is bound only with `luau`, so a Rust-only build carries none of it.
 
@@ -105,14 +101,14 @@ zgx's layout defaults are CSS flexbox's, so styles map nearly one to one: a `col
 Shown as a labelled placeholder box, or left out:
 
 - **GPU content**: WGSL fills and layer shaders, `gpu_view`, zgx-3d scenes, native surfaces, terminals, web views and video export draw with a GPU or a platform view zgx-dom doesn't have. A `<canvas>` with WebGPU could host them later.
-- **Luau apps' host services**: sockets, files, plugins from the disk, hot reload and `zgx check` need hosts zgx-dom doesn't have yet; images in Luau apps show their labels (zgx-script decodes them with zgx-gpu, which isn't linked in the browser).
+- **Luau apps' host services**: sockets, files, scripts loaded from the disk, hot reload and `zgx check` need hosts zgx-dom doesn't have yet; images in Luau apps show their labels (zgx-script decodes them with zgx-gpu, which isn't linked in the browser).
 - **Overlays**: `at_caret`, `hoist` and `modal_placement` placement; menus have no typeahead; an arrow has no border on its outer edges.
 - **Rich text**: a link's middle click.
 - **Input**: `drag_preview` builders (a copy of the source stands for them), file drops, `drag_export` and pinch; text and IME stay the browser's own in `<input>` and `<textarea>`. `reactive_interaction` isn't applied.
 - **Lists**: the `_watched` variants' watchers aren't called.
 - **Windows**: `ui.window.popups` stays empty (the browser's top layer holds popups); `zgx inspect` and `zgx test`'s heap tools (`gc`, `app:retained_states`) are desktop devtools.
 - **Canvas**: a canvas view's pan and zoom (`canvas_view`) isn't applied.
-- **Text areas' line styles (desktop first)**: a highlighter span's `size`, `line_height`, `font = "mono"` and chip (`SpanStyle::size`, `line_height`, `mono`, `chip`), and lines' room and hiding (`EditorHandle::set_line_insets`, `LineInset`, a textarea's `line_insets`), lines' marks (`EditorHandle::set_line_marks`, `LineMark`, a textarea's `line_marks`), and lines that scroll sideways in a group and never wrap (`LineInset::scroll_group` and `nowrap`, `LineMark::pinned`, `EditorHandle::set_group_scroll` and `set_group_frame`, `View::group_scrollbar`; a textarea's `group`, `nowrap`, `pinned` and `group_scrollbar`) shape and place a desktop text area's lines; a `<textarea>` has one style, so the browser shows the text plainly. To map with the contenteditable atom editor (`docs/dom.md`, atoms), pending Wing's OK on landing them desktop first.
+- **Text areas' line styles (desktop first)**: a highlighter span's `size`, `line_height`, `font = "mono"` and chip (`SpanStyle::size`, `line_height`, `mono`, `chip`), and lines' room and hiding (`EditorHandle::set_line_insets`, `LineInset`, a textarea's `line_insets`), lines' marks (`EditorHandle::set_line_marks`, `LineMark`, a textarea's `line_marks`), and lines that scroll sideways in a group and never wrap (`LineInset::scroll_group` and `nowrap`, `LineMark::pinned`, marks' `decoration`, `image`, `svg`, `align` and `rotate`, `EditorHandle::set_group_scroll` and `set_group_frame`, `View::group_scrollbar`; a textarea's `group`, `nowrap`, `pinned` and `group_scrollbar`) shape and place a desktop text area's lines; a `<textarea>` has one style, so the browser shows the text plainly. To map with the contenteditable atom editor (`docs/dom.md`, atoms), pending Wing's OK on landing them desktop first.
 - **Also not yet mapped**: SVG, and a `NodeHandle`'s layout, editor and scene methods.
 - **Sizes worked out** (`w_calc` and the like) aren't written as CSS yet.
 

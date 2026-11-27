@@ -849,25 +849,26 @@ pub(crate) fn mount_links(
         if geometry_key.as_ref() != Some(&key) {
             geometry = if data.links.is_empty() {
                 Vec::new()
+            } else if !(bounds.width > 0. && bounds.height > 0.) {
+                // Not laid out yet (mounted this frame): every box would be
+                // cut to nothing by the paragraph's, so none is shaped for.
+                vec![Vec::new(); data.links.len()]
             } else {
                 // At the width its lines wrap at, where they show
                 // (balanced). A change of balance moves `engine`.
+                // From the lines laid out for it, where its host says
+                // (`rich_text_selection`), else shaped for them.
                 let scene = ui.scene.borrow();
                 let (wrap, inset) = scene.text_wrap(paragraph, bounds.width);
-                let layout = crate::text_layout::Inset::around(
-                    scene.shape_rich_text(&data.rich, Some(wrap)),
-                    inset,
-                );
+                let ranges: Vec<_> = data.links.iter().map(|l| l.range.clone()).collect();
+                let found = scene.rich_text_selection(&data.rich, Some(wrap), &ranges);
                 drop(scene);
-                data.links
-                    .iter()
-                    .map(|link| {
-                        layout
-                            .selection(link.range.clone())
-                            .into_iter()
-                            .filter_map(|rect| {
-                                rect.intersection(Rect::new(0., 0., bounds.width, bounds.height))
-                            })
+                let within = Rect::new(0., 0., bounds.width, bounds.height);
+                (found.into_iter())
+                    .map(|rects| {
+                        (rects.into_iter())
+                            .map(|rect| Rect::new(rect.x + inset, rect.y, rect.width, rect.height))
+                            .filter_map(|rect| rect.intersection(within))
                             .filter(|r| r.width > 0. && r.height > 0.)
                             .collect()
                     })
@@ -1034,9 +1035,12 @@ pub(crate) fn mount_links(
                     if !scene.contains(node) {
                         return;
                     }
+                    // Painted over the link's lines (`border_over`): a ring
+                    // taking room would move the boxes inside it.
                     let quad = QuadStyle {
                         border_width: border,
                         border_color: ring.color_untracked(crate::theme::tok::FOCUS_RING),
+                        border_over: true,
                         ..Default::default()
                     };
                     scene.set_kind(
@@ -1118,6 +1122,7 @@ pub(crate) fn mount_links(
                     0.
                 },
                 border_color: theme.color(crate::theme::tok::FOCUS_RING),
+                border_over: true,
                 ..Default::default()
             };
             for (i, rect) in rects.iter().skip(1).enumerate() {

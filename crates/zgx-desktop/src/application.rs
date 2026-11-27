@@ -1038,18 +1038,30 @@ impl WindowContext {
             windows: Some(self.windows.clone()),
         }));
         // Pages as images of WebKitGTK's (`web_view` asks it first).
+        let pages: Option<zgx::web_view::PageViews> = None;
         #[cfg(all(target_os = "linux", feature = "webkitgtk"))]
-        let view = zgx::compose::provide(
-            crate::native_host::webkitgtk::page_views(self.windows.clipboard.clone(), {
+        let pages = pages.or(Some(crate::native_host::webkitgtk::page_views(
+            self.windows.clipboard.clone(),
+            {
                 let dialogs = self.dialogs.clone();
                 Rc::new(move || {
                     dialogs
                         .window()
                         .and_then(|window| crate::x11_nudge::xid(&window))
                 })
-            }),
-            view,
-        );
+            },
+        )));
+        // Ladybird's pages (`WebEngine::Ladybird`), the others as above, or
+        // native views.
+        #[cfg(all(unix, feature = "ladybird"))]
+        let pages = Some(crate::native_host::ladybird::page_views(
+            pages,
+            self.windows.clipboard.clone(),
+        ));
+        let view = match pages {
+            Some(pages) => zgx::compose::provide(pages, view),
+            None => view,
+        };
         // Terminals zgx draws, where Ghostty doesn't.
         #[cfg(all(
             feature = "terminal",
@@ -1455,6 +1467,17 @@ static RENDER_WHEN_COVERED: std::sync::LazyLock<bool> = std::sync::LazyLock::new
     zgx::env::var_os("ZGX_RENDER_WHEN_COVERED").is_some_and(|v| !v.is_empty() && v != "0")
         || *crate::window_chrome::OFFSCREEN
 });
+/// The idle trim armed at `now` (`TRIM_DELAY` on), with no frame presented to
+/// arm it: unless a trim is due already (only what goes at rest, `Rest`,
+/// counts as none). Re-armed as it runs while frames stay away, it trims
+/// again `TRIM_DELAY` after each.
+fn armed_trim(
+    trim_at: Option<std::time::Instant>,
+    stage: TrimStage,
+    now: std::time::Instant,
+) -> Option<(std::time::Instant, TrimStage)> {
+    (trim_at.is_none() || stage == TrimStage::Rest).then_some((now + TRIM_DELAY, TrimStage::Trim))
+}
 /// What a window's next trim is for (`Host::trim_at`): the trim of what
 /// animation alone used, or what goes later at rest (`Rest`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2106,6 +2129,10 @@ struct Host {
     /// The window's frame's and the popup host's last contained panics,
     /// and the damaged frames tried (`contain::run`).
     render_fault: Option<crate::contain::Fault>,
+    /// The window's frame left undrawn by one (`render_fault`): when it is
+    /// tried again. Nothing else need wake the loop for it: a window with
+    /// no input or animation would sit on its last frame however long.
+    render_retry: Option<std::time::Instant>,
     popups_fault: Option<crate::contain::Fault>,
     _layout_issues: zgx::issues::IssueListener,
     /// What its listener heard, for its own banner (`show_issues`).
@@ -2605,6 +2632,7 @@ impl Host {
             renderer_retry: None,
             error_banner: None,
             render_fault: None,
+            render_retry: None,
             popups_fault: None,
             _layout_issues: layout_issues,
             issues: issues.clone(),
@@ -3438,6 +3466,15 @@ impl Host {
                 // so is every view it scrolled (`hold_frame`).
                 hold_frame(&mut self.held_damage, damage, &scene);
                 window.request_redraw();
+                // And what that layout shaped is trimmed as a frame would have
+                // it trimmed, if none comes (a window hidden or covered under
+                // its updates): the trim armed, unless one is due already.
+                if let Some((at, stage)) =
+                    armed_trim(self.trim_at, self.trim_stage, std::time::Instant::now())
+                {
+                    self.trim_at = Some(at);
+                    self.trim_stage = stage;
+                }
             } else {
                 // Steady frames render at a time of their own within their
                 // wait for the refresh point (`Latch::hold`); a scroll's at a
@@ -3540,11 +3577,29 @@ impl Host {
                             // Shown: the next waits for the compositor's
                             // frame, as a GPU present's does.
                             self.present_ready = false;
+                            // And the window's idle trims are armed, as a GPU
+                            // present arms them: unarmed, a window on the
+                            // raster never came to rest.
+                            let now = std::time::Instant::now();
+                            self.trim_at = Some(now + TRIM_DELAY);
+                            self.release_rows_at = Some(now + zgx::spare::KEPT_REST);
+                            self.trim_stage = TrimStage::Trim;
+                            self.rest = Rest::none();
+                            if self.startup_trim == StartupTrim::Pending {
+                                self.startup_trim = StartupTrim::At(now + STARTUP_TRIM_DELAY);
+                            }
                         }
                         None => undrawn = true,
                     }
                 }
                 self.force = undrawn;
+                // Undrawn: tried again when the fault allows, the loop woken
+                // for it (`about_to_wait`); drawn: nothing owed.
+                self.render_retry = if undrawn {
+                    crate::contain::retry_at(self.render_fault.as_ref())
+                } else {
+                    None
+                };
                 self.held_damage.clear();
             }
         }
@@ -3861,17 +3916,18 @@ impl Host {
         let role = pointer.and_then(|id| ui.semantics.borrow().get(id).map(|node| node.role));
         let scene = ui.scene.borrow();
         let revision = scene.interaction_revision();
+        // Where the interface has the pointer: winit's point, or where a
+        // driver moved it into the interface alone (`zgx inspect`, an agent,
+        // a test), so the cursor is what hover is over, and asks from the
+        // walk that found it (`Scene::with_hits`) rather than walk again.
+        let at = ui.input.pointer().unwrap_or(self.cursor);
         if self.pointer_inside
             && self
                 .cursor_query
                 .as_ref()
-                .is_none_or(|(point, version, _)| *point != self.cursor || *version != revision)
+                .is_none_or(|(point, version, _)| *point != at || *version != revision)
         {
-            self.cursor_query = Some((
-                self.cursor,
-                revision,
-                ui.input.cursor_at(&scene, self.cursor.0, self.cursor.1),
-            ));
+            self.cursor_query = Some((at, revision, ui.input.cursor_at(&scene, at.0, at.1)));
         }
         let explicit = ui
             .input
@@ -6854,6 +6910,8 @@ impl Host {
         // focus they took or gave back, at this safe point.
         #[cfg(all(target_os = "linux", feature = "webkitgtk"))]
         crate::native_host::webkitgtk::deliver_pages();
+        #[cfg(all(unix, feature = "ladybird"))]
+        crate::native_host::ladybird::deliver();
         zgx::native_view::deliver_posted();
         // Moves zgx heard through the native views' pointer monitor.
         if let Some(pointer) = self.native.take_unheard_pointer() {
@@ -7111,7 +7169,10 @@ impl Host {
                     renderer.trim();
                 }
                 if let Some(raster) = &mut self.raster {
+                    // Core Text's glyphs (`trim`), and the text services'
+                    // words and prepared text but the last frame's (`rest`).
                     raster.trim();
+                    raster.rest();
                 }
                 // What goes later, each at its own delay past this trim: the
                 // glyph atlas (a window that grew one), and Metal's queue once
@@ -7419,10 +7480,11 @@ impl Host {
         let ui = &self.context.ui;
         let asked = zgx::idle::take_request(&ui.runtime);
         if (asked || (ui.reclaiming() && !self.frames_presented()))
-            && (self.trim_at.is_none() || self.trim_stage == TrimStage::Rest)
+            && let Some((at, stage)) =
+                armed_trim(self.trim_at, self.trim_stage, std::time::Instant::now())
         {
-            self.trim_at = Some(std::time::Instant::now() + TRIM_DELAY);
-            self.trim_stage = TrimStage::Trim;
+            self.trim_at = Some(at);
+            self.trim_stage = stage;
         }
     }
     /// The native source's watchdog: due `WATCHDOG` after its last tick
@@ -8318,6 +8380,13 @@ impl WindowManager {
                     _ => None,
                 }
             });
+        if crate::app_menu::trace_keys() {
+            eprintln!(
+                "TRACE menu-action {:?} window={focused:?} of {}",
+                action.0,
+                self.hosts.len()
+            );
+        }
         if let Some(token) = focused {
             self.menu_action(token, action);
         }
@@ -8374,6 +8443,10 @@ impl WindowManager {
             return;
         }
         if !crate::app_menu::enabled_action(&self.factory.menus.borrow(), &action) {
+            #[cfg(target_os = "macos")]
+            if crate::app_menu::trace_keys() {
+                eprintln!("TRACE menu-action {:?}: no enabled item has it", action.0);
+            }
             return;
         }
         if let Some(host) = self.hosts.get_mut(&token) {
@@ -8964,6 +9037,20 @@ impl WindowManager {
             self.request_close(token);
             return;
         }
+        // A frame failing again, waiting longer each time: input has it
+        // tried at once.
+        if matches!(
+            event,
+            WindowEvent::KeyboardInput { .. }
+                | WindowEvent::MouseInput { .. }
+                | WindowEvent::MouseWheel { .. }
+                | WindowEvent::Touch(..)
+        ) && let Some(host) = self.hosts.get_mut(&token)
+            && host.render_fault.is_some()
+        {
+            crate::contain::hurry(&mut host.render_fault);
+            host.render_retry = crate::contain::retry_at(host.render_fault.as_ref());
+        }
         if matches!(event, WindowEvent::Destroyed) {
             self.close(token);
             return;
@@ -9151,6 +9238,7 @@ impl WindowManager {
             #[cfg(not(target_os = "macos"))]
             let plane_room = false;
             if (host.renderer_retry.is_some_and(|at| at <= now)
+                || host.render_retry.is_some_and(|at| at <= now)
                 || host.plane_retry.is_some_and(|at| at <= now)
                 || plane_room)
                 && let Some(window) = &host.window
@@ -9199,6 +9287,7 @@ impl WindowManager {
                     host.frame_deadline,
                     host.popups.deadline(),
                     host.renderer_retry,
+                    host.render_retry,
                     host.plane_retry,
                     host.frames_held,
                     host.touch.hold_deadline(),
@@ -10386,6 +10475,26 @@ mod tests {
         );
         // A queue that never rested (a window's first frames): not lone.
         assert_eq!(lone_wake(None, tick), None);
+    }
+    /// A window laying out with no frame to show it arms its trim, unless
+    /// one is due; what goes later at rest is no trim, and it arms again
+    /// after each trim while frames stay away.
+    #[test]
+    fn a_window_with_no_frames_arms_its_trim_unless_one_is_due() {
+        use super::{TRIM_DELAY, TrimStage, armed_trim};
+        let now = std::time::Instant::now();
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(
+            armed_trim(None, TrimStage::Trim, now),
+            Some((now + TRIM_DELAY, TrimStage::Trim))
+        );
+        // A trim due (a frame presented a moment ago armed it): kept.
+        assert_eq!(armed_trim(Some(now + ms(200)), TrimStage::Trim, now), None);
+        // Only the atlas or the queue owed: the trim comes first.
+        assert_eq!(
+            armed_trim(Some(now + ms(20_000)), TrimStage::Rest, now),
+            Some((now + TRIM_DELAY, TrimStage::Trim))
+        );
     }
     #[test]
     fn rest_gives_back_the_atlas_then_the_queue() {

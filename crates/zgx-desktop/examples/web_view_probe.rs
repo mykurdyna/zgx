@@ -45,7 +45,7 @@ use zgx::{
 };
 use zgx_desktop::{Application, MenuAction, WindowOptions};
 
-const PAGE: &str = r#"<!doctype html><html><head><title>probe page</title><style>
+const PAGE: &str = r#"<!doctype html><html><head><title>probe page</title><meta name="theme-color" content="rgb(51,102,153)"><style>
 html, body { margin: 0; background: rgb(0, 0, 255); height: 3000px; }
 #field { position: absolute; left: 20px; top: 20px; width: 300px; height: 40px; font-size: 20px; box-sizing: border-box; }
 #choice { position: absolute; left: 360px; top: 20px; width: 200px; height: 30px; }
@@ -120,6 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 transparent,
                 inspectable: true,
                 accelerated: !std::env::args().any(|arg| arg == "--unaccelerated"),
+                favicons: true,
                 ..Default::default()
             };
             let web = WebView::new(&cx.ui.runtime, options);
@@ -259,6 +260,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             )
                         });
                     }
+                    // Ctrl+S, Ctrl+Y: a snapshot of what shows, of the whole
+                    // page: `SNAPSHOT <area> <w>x<h> <r,g,b,a at (5, y)>`, y
+                    // 5 or, for the whole page, 2500 (the 3000-pixel page's).
+                    if let Some((area, y)) = match action.0.as_str() {
+                        "s" => Some((zgx::web_view::SnapshotArea::Visible, 5)),
+                        "y" => Some((zgx::web_view::SnapshotArea::FullPage, 2500)),
+                        _ => None,
+                    } {
+                        let name = if y == 5 { "visible" } else { "full" };
+                        inspect.snapshot(area, move |result| match result {
+                            Ok(image) => {
+                                let pixel = if image.height() > y {
+                                    let at = ((y * image.width() + 5) * 4) as usize;
+                                    let p = &image.pixels()[at..at + 4];
+                                    format!("{},{},{},{}", p[0], p[1], p[2], p[3])
+                                } else {
+                                    "-".into()
+                                };
+                                println!(
+                                    "SNAPSHOT {name} {}x{} {pixel}",
+                                    image.width(),
+                                    image.height()
+                                )
+                            }
+                            Err(error) => println!("SNAPSHOT {name} error {error}"),
+                        });
+                    }
+                    // Ctrl+H: a page with an icon (`ZGX_PROBE_ICON_PAGE`,
+                    // the smoke's server: WebKitGTK loads only http(s)
+                    // icons, not `data:` or an app scheme's).
+                    if action.0 == "h" {
+                        inspect.load_url(std::env::var("ZGX_PROBE_ICON_PAGE").unwrap_or_default());
+                    }
+                    // Ctrl+O: select all of the page and copy it; Ctrl+U:
+                    // reload ignoring the cache (`EDIT`/`RELOAD` say how
+                    // each went).
+                    if action.0 == "o" {
+                        let done = inspect
+                            .edit(zgx::web_view::EditCommand::SelectAll)
+                            .and_then(|()| inspect.edit(zgx::web_view::EditCommand::Copy));
+                        println!("EDIT {done:?}");
+                    }
+                    if action.0 == "u" {
+                        println!("RELOAD {:?}", inspect.reload_ignoring_cache());
+                    }
                     // Ctrl+D: the app saves the page's downloads, into
                     // `ZGX_PROBE_SAVE_DIR`, telling each and how it goes.
                     if action.0 == "d" {
@@ -297,7 +343,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .bind(bind("p").reserved())
                     .bind(bind("f").reserved())
                     .bind(bind("g").reserved())
-                    .bind(bind("d").reserved()),
+                    .bind(bind("d").reserved())
+                    .bind(bind("s").reserved())
+                    .bind(bind("y").reserved())
+                    .bind(bind("o").reserved())
+                    .bind(bind("u").reserved())
+                    .bind(bind("h").reserved()),
             );
             // `FULL_SCREEN <bool>` as the page's full screen changes.
             let full_screen = {
@@ -310,8 +361,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 })
             };
+            // `FAVICON <w>x<h>` as the page's icon arrives.
+            let favicon = {
+                let web = web.clone();
+                let shown = std::cell::Cell::new(None);
+                cx.ui.runtime.effect(move || {
+                    let size = web.state().with(|state| {
+                        state
+                            .favicon
+                            .as_ref()
+                            .map(|icon| (icon.width(), icon.height()))
+                    });
+                    if shown.replace(size) != size
+                        && let Some((width, height)) = size
+                    {
+                        println!("FAVICON {width}x{height}");
+                    }
+                })
+            };
+            // `HOVERED <link or ->` and `THEME <#rrggbbaa or ->` as they change.
+            let page_state = {
+                let web = web.clone();
+                let shown = std::cell::RefCell::new((None, None));
+                cx.ui.runtime.effect(move || {
+                    let now = web
+                        .state()
+                        .with(|state| (state.hovered_link.clone(), state.theme_color));
+                    let mut shown = shown.borrow_mut();
+                    if shown.0 != now.0 {
+                        println!("HOVERED {}", now.0.as_deref().unwrap_or("-"));
+                    }
+                    if shown.1 != now.1 {
+                        match now.1 {
+                            Some(zgx::scene::Color(r, g, b, a)) => {
+                                println!("THEME #{r:02x}{g:02x}{b:02x}{a:02x}")
+                            }
+                            None => println!("THEME -"),
+                        }
+                    }
+                    *shown = now;
+                })
+            };
             cx.tasks.spawn(async move {
-                let _keep = (events, keymap, web, full_screen);
+                let _keep = (events, keymap, web, full_screen, page_state, favicon);
                 std::future::pending::<()>().await;
             });
         })
